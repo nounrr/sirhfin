@@ -311,27 +311,33 @@ class TodoTaskController extends Controller
         });
 
         // Check if status changed to "Annulé" and notify assignees
-        if ($newStatus && strtolower($newStatus) === 'annulé') {
-            if ($oldStatus && strtolower($oldStatus) !== 'annulé') {
-                \Log::info("Task #{$task->id} status changed to Annulé - sending cancellation notifications", [
-                    'old_status' => $oldStatus,
-                    'new_status' => $newStatus,
-                ]);
-                
-                $sync = (bool) config('twilio.sync_on_task_events', false);
-                if ($sync) {
-                    \App\Jobs\SendTaskCancelledNotifications::dispatchSync($task->id);
+        if ($newStatus) {
+            $normalizedNewStatus = $this->normalizeStatus($newStatus);
+            $normalizedOldStatus = $oldStatus ? $this->normalizeStatus($oldStatus) : '';
+            
+            if ($normalizedNewStatus === 'annule') {
+                if ($normalizedOldStatus !== 'annule') {
+                    \Log::info("Task #{$task->id} status changed to Annulé - sending cancellation notifications", [
+                        'old_status' => $oldStatus,
+                        'new_status' => $newStatus,
+                    ]);
+                    
+                    $sync = (bool) config('twilio.sync_on_task_events', false);
+                    if ($sync) {
+                        $taskId = $task->id;
+                        DB::afterCommit(function () use ($taskId) {
+                            \App\Jobs\SendTaskCancelledNotifications::dispatchSync($taskId);
+                        });
+                    } else {
+                        \App\Jobs\SendTaskCancelledNotifications::dispatch($task->id)->afterCommit();
+                    }
                 } else {
-                    \App\Jobs\SendTaskCancelledNotifications::dispatch($task->id)->afterCommit();
+                    \Log::debug("Task #{$task->id} status is Annulé but was already Annulé - skipping notification", [
+                        'old_status' => $oldStatus,
+                        'new_status' => $newStatus,
+                    ]);
                 }
             } else {
-                \Log::debug("Task #{$task->id} status is Annulé but was already Annulé - skipping notification", [
-                    'old_status' => $oldStatus,
-                    'new_status' => $newStatus,
-                ]);
-            }
-        } else {
-            if ($newStatus) {
                 \Log::debug("Task #{$task->id} status updated but not to Annulé - no cancellation notification", [
                     'old_status' => $oldStatus,
                     'new_status' => $newStatus,
@@ -473,5 +479,25 @@ class TodoTaskController extends Controller
             ->unique()
             ->values()
             ->all();
+    }
+
+    private function normalizeStatus(string $status): string
+    {
+        $normalized = trim($status);
+        
+        // Convertir en minuscules
+        if (function_exists('mb_strtolower')) {
+            $normalized = mb_strtolower($normalized, 'UTF-8');
+        } else {
+            $normalized = strtolower($normalized);
+        }
+        
+        // Remplacer les caractères accentués
+        $normalized = str_replace(['é', 'è', 'ê', 'ë'], 'e', $normalized);
+        $normalized = str_replace(['à', 'á', 'â', 'ã', 'ä'], 'a', $normalized);
+        $normalized = str_replace(['ù', 'ú', 'û', 'ü'], 'u', $normalized);
+        $normalized = str_replace(['ç'], 'c', $normalized);
+        
+        return $normalized;
     }
 }
