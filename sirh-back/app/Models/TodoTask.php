@@ -35,19 +35,45 @@ class TodoTask extends Model
 
         static::updated(function ($todoTask) {
             static::auditLog($todoTask, 'updated');
-            // Notifications on update are dispatched by the controller
-            // where we can accurately detect new assignees and primary changes.
+            
+            // Check for status change to "Annulé"
+            if ($todoTask->wasChanged('status')) {
+                $newStatus = $todoTask->status;
+                $oldStatus = $todoTask->getOriginal('status');
+                
+                $normalizedNewStatus = static::normalizeStatus($newStatus);
+                $normalizedOldStatus = $oldStatus ? static::normalizeStatus($oldStatus) : '';
+                
+                if ($normalizedNewStatus === 'annule' && $normalizedOldStatus !== 'annule') {
+                    \Log::info("Task #{$todoTask->id} status changed to Annulé in model observer - sending cancellation notifications", [
+                        'old_status' => $oldStatus,
+                        'new_status' => $newStatus,
+                    ]);
+                    
+                    $sync = (bool) config('twilio.sync_on_task_events', false);
+                    $taskId = $todoTask->id;
+                    
+                    if ($sync) {
+                        DB::afterCommit(function () use ($taskId) {
+                            \App\Jobs\SendTaskCancelledNotifications::dispatchSync($taskId);
+                        });
+                    } else {
+                        \App\Jobs\SendTaskCancelledNotifications::dispatch($taskId)->afterCommit();
+                    }
+                }
+            }
+            
+            // Check for completion notifications
             if ($todoTask->wasChanged('pourcentage') || $todoTask->wasChanged('status')) {
                 $status = strtolower((string)$todoTask->status);
                 if ($status === 'terminée' || $status === 'terminee' || (is_numeric($todoTask->pourcentage) && (int)$todoTask->pourcentage >= 100)) {
                     $sync = (bool) config('twilio.sync_on_task_events', false);
                     if ($sync) {
-                        $taskId = $todoTask->id;
-                        DB::afterCommit(function () use ($taskId) {
-                            \App\Jobs\SendTaskCompletedNotifications::dispatchSync($taskId);
-                        });
+                        // Use dispatchSync directly - afterCommit seems to cause issues in observers
+                        \App\Jobs\SendTaskCompletedNotifications::dispatchSync($todoTask->id);
                     } else {
-                        \App\Jobs\SendTaskCompletedNotifications::dispatch($todoTask->id)->afterCommit();
+                        // Use dispatch without afterCommit - let Laravel handle the transaction
+                        \App\Jobs\SendTaskCompletedNotifications::dispatch($todoTask->id);
                     }
                 }
             }
@@ -128,5 +154,25 @@ class TodoTask extends Model
     public function getSourceAttribute()
     {
         return $this->origine;
+    }
+
+    private static function normalizeStatus(string $status): string
+    {
+        $normalized = trim($status);
+        
+        // Convertir en minuscules
+        if (function_exists('mb_strtolower')) {
+            $normalized = mb_strtolower($normalized, 'UTF-8');
+        } else {
+            $normalized = strtolower($normalized);
+        }
+        
+        // Remplacer les caractères accentués
+        $normalized = str_replace(['é', 'è', 'ê', 'ë'], 'e', $normalized);
+        $normalized = str_replace(['à', 'á', 'â', 'ã', 'ä'], 'a', $normalized);
+        $normalized = str_replace(['ù', 'ú', 'û', 'ü'], 'u', $normalized);
+        $normalized = str_replace(['ç'], 'c', $normalized);
+        
+        return $normalized;
     }
 }

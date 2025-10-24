@@ -22,7 +22,7 @@ class SendTaskCompletedNotifications implements ShouldQueue
         $task = TodoTask::with([
             'assignees:id,name,prenom,tel',
             'assignedUser:id,name,prenom,tel',
-            'list:id,title,name',
+            'list:id,title,created_by',
         ])->find($this->taskId);
 
         if (!$task) {

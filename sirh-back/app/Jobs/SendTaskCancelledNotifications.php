@@ -19,15 +19,25 @@ class SendTaskCancelledNotifications implements ShouldQueue
 
     public function handle(TwilioService $twilio): void
     {
+        Log::info("SendTaskCancelledNotifications job started", ['task_id' => $this->taskId]);
+        
         $task = TodoTask::with([
             'assignees:id,name,prenom,tel',
             'assignedUser:id,name,prenom,tel',
-            'list:id,title,name',
+            'list:id,title,created_by',
         ])->find($this->taskId);
         
         if (!$task) {
+            Log::warning("Task not found for cancellation notification", ['task_id' => $this->taskId]);
             return;
         }
+        
+        Log::info("Task found for cancellation notification", [
+            'task_id' => $this->taskId,
+            'task_status' => $task->status,
+            'assignees_count' => $task->assignees ? $task->assignees->count() : 0,
+            'assigned_user_id' => $task->assigned_to,
+        ]);
 
         $users = collect();
         if ($task->assignees) {
