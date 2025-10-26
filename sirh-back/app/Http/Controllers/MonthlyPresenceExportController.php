@@ -15,6 +15,8 @@ use Illuminate\Support\Facades\Auth;
 use App\Models\JourFerie;
 use DateTime;
 use App\Services\TimeCalculationService;
+use App\Services\PresenceUserService;
+// PresenceDataService merged into TimeCalculationService
 use PhpOffice\PhpSpreadsheet\Style\NumberFormat;
 use App\Services\PresenceSheetService;
 
@@ -77,11 +79,124 @@ private function col(int $i): string {
         if (!$dateRange) {
             return response()->json(['error' => 'Paramètres de date requis'], 400);
         }
+
+        // Diagnostic log: vérifier accès DB et présence des pointages de la période pour la société
+        $diag_tableExists = null;
+        $diag_totalAll = 0; $diag_totalPeriodAll = 0; $diag_totalPeriodSociete = 0;
+        $diag_maxDateAll = null; $diag_maxDateSociete = null;
+        try {
+            $dbName = \DB::connection()->getDatabaseName();
+            $userAuth = \Auth::user();
+            $societeId = $userAuth->societe_id ?? null;
+            $start = $dateRange['startDate']->format('Y-m-d');
+            $end   = $dateRange['endDate']->format('Y-m-d');
+
+            $tableExists = true;
+            try {
+                // Test simple d'existence en listant 1 ligne
+                \DB::table('pointages')->limit(1)->first();
+            } catch (\Throwable $e) {
+                $tableExists = false;
+            }
+
+            $totalAll = 0; $totalPeriodAll = 0; $totalPeriodSociete = 0; $sample = [];
+            $maxDateAll = null; $maxDateSociete = null; $sampleRecentSociete = [];
+            if ($tableExists) {
+                $totalAll = (int) \DB::table('pointages')->count();
+                $maxDateAll = \DB::table('pointages')->max('date');
+                $totalPeriodAll = (int) \DB::table('pointages')
+                    ->whereBetween('date', [$start, $end])
+                    ->count();
+                if ($societeId) {
+                    $totalPeriodSociete = (int) \DB::table('pointages')
+                        ->join('users','users.id','=','pointages.user_id')
+                        ->where('users.societe_id', $societeId)
+                        ->whereBetween('pointages.date', [$start, $end])
+                        ->count();
+                    $maxDateSociete = \DB::table('pointages')
+                        ->join('users','users.id','=','pointages.user_id')
+                        ->where('users.societe_id', $societeId)
+                        ->max('pointages.date');
+                    $sample = \DB::table('pointages')
+                        ->join('users','users.id','=','pointages.user_id')
+                        ->leftJoin('departements','departements.id','=','pointages.departement_id')
+                        ->where('users.societe_id', $societeId)
+                        ->whereBetween('pointages.date', [$start, $end])
+                        ->select('pointages.date','pointages.user_id','pointages.statutJour','pointages.heureEntree','pointages.heureSortie',\DB::raw('COALESCE(departements.nom, "") as dept'))
+                        ->orderBy('pointages.date')
+                        ->limit(5)
+                        ->get()
+                        ->toArray();
+                    // échantillon récent (5 dernières lignes de la société toutes périodes)
+                    $sampleRecentSociete = \DB::table('pointages')
+                        ->join('users','users.id','=','pointages.user_id')
+                        ->leftJoin('departements','departements.id','=','pointages.departement_id')
+                        ->where('users.societe_id', $societeId)
+                        ->select('pointages.date','pointages.user_id','pointages.statutJour','pointages.heureEntree','pointages.heureSortie',\DB::raw('COALESCE(departements.nom, "") as dept'))
+                        ->orderBy('pointages.date','desc')
+                        ->limit(5)
+                        ->get()
+                        ->toArray();
+                }
+            }
+
+            // Exposer les diagnostics hors du bloc try
+            $diag_tableExists = $tableExists;
+            $diag_totalAll = $totalAll; $diag_totalPeriodAll = $totalPeriodAll; $diag_totalPeriodSociete = $totalPeriodSociete;
+            $diag_maxDateAll = $maxDateAll; $diag_maxDateSociete = $maxDateSociete;
+
+            \Log::info('📊 DIAGNOSTIC POINTAGES', [
+                'db' => $dbName,
+                'table_pointages_exists' => $tableExists,
+                'period' => $start.' to '.$end,
+                'total_pointages_all' => $totalAll,
+                'total_pointages_period_all' => $totalPeriodAll,
+                'total_pointages_period_societe' => $totalPeriodSociete,
+                'max_date_all' => $maxDateAll,
+                'max_date_societe' => $maxDateSociete,
+                'sample_period_societe' => $sample,
+                'sample_recent_societe' => $sampleRecentSociete,
+            ]);
+        } catch (\Throwable $e) {
+            \Log::warning('Diagnostic pointages failed', ['error' => $e->getMessage()]);
+        }
+
+        // Fallback automatique: si aucune donnée pour la période, basculer sur le dernier mois contenant des données
+        if ($diag_tableExists === true && $diag_totalPeriodAll === 0) {
+            $fallbackDateStr = $diag_maxDateSociete ?: $diag_maxDateAll; // privilégier la société
+            if (!empty($fallbackDateStr)) {
+                try {
+                    $fallbackDate = new DateTime($fallbackDateStr);
+                    // Aller au premier jour du mois de la dernière donnée
+                    $startDate = new DateTime($fallbackDate->format('Y-m-01'));
+                    $endDate   = (clone $startDate)->modify('last day of this month');
+                    $currentMonth = date('Y-m');
+                    $month = $startDate->format('Y-m');
+                    // Construire un nouveau dateRange
+                    $dateRange = [
+                        'type' => 'month',
+                        'startDate' => $startDate,
+                        'endDate'   => $endDate,
+                        'totalDays' => (int)$startDate->format('t'),
+                        'label'     => $startDate->format('Y-m'),
+                        'is_current_month' => ($month === $currentMonth)
+                    ];
+                    \Log::warning('Aucune donnée sur la période demandée: bascule automatique sur le dernier mois avec données', [
+                        'fallback_month' => $dateRange['label'],
+                        'max_date_all' => $diag_maxDateAll,
+                        'max_date_societe' => $diag_maxDateSociete,
+                    ]);
+                } catch (\Throwable $e) {
+                    \Log::warning('Échec du fallback automatique de période', ['error' => $e->getMessage(), 'fallback_date' => $fallbackDateStr]);
+                }
+            }
+        }
         $spreadsheet = new Spreadsheet();
 
         // Utilisateurs préparés via helper réutilisable
         $userAuth = Auth::user();
-        $presenceCollections = $this->getPresenceUserCollections($userAuth->societe_id);
+    // Déléguer la construction des collections au service réutilisable
+    $presenceCollections = (new PresenceUserService())->getPresenceUserCollections($userAuth->societe_id, $this->excludedUserIds);
         $users = $presenceCollections['all'];
         $permanentUsers = $presenceCollections['permanent'];
         $temporaryUsers = $presenceCollections['temporary'];
@@ -97,6 +212,12 @@ private function col(int $i): string {
 
         /* ===================== FEUILLE SORTANTS ===================== */
         $this->createSortantsSheet($spreadsheet, $userAuth->societe_id);
+
+    /* ===================== FEUILLES LISTE PERSONNEL & NON AFFECTÉS ===================== */
+    // Liste des employés sans affectation de département
+    $this->createNonAffectesSheet($spreadsheet, $userAuth->societe_id);
+    // Liste du personnel affecté (exclut explicitement les "Non Affectés")
+    $this->createListePersonnelSheet($spreadsheet, $userAuth->societe_id);
 
         // Déterminer les rôles utilisateur (corrige l'erreur Undefined variable $userRole)
         $userRoleRaw = (string)($userAuth->role ?? '');
@@ -132,49 +253,8 @@ private function col(int $i): string {
      */
     public function getPresenceUserCollections(int $societeId): array
     {
-        $users = DB::table('users')
-            ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
-            ->where('users.societe_id', $societeId)
-            ->whereNotIn('users.id', $this->excludedUserIds)
-            ->select('users.*', 'departements.nom as departement_nom')
-            ->get();
-
-        $inactiveUsers = $users->filter(function($u) {
-            return strtolower(trim((string)($u->statut ?? ''))) === 'inactif';
-        });
-
-        if ($inactiveUsers->count() > 0) {
-            Log::info('Utilisateurs inactifs trouvés', [
-                'count_total_inactifs' => $inactiveUsers->count(),
-                'inactifs' => $inactiveUsers->map(function($u) {
-                    return [
-                        'id' => $u->id,
-                        'name' => $u->name ?? 'N/A',
-                        'statut' => $u->statut ?? 'N/A',
-                        'typeContrat' => $u->typeContrat ?? 'N/A',
-                        'isPermanent' => $this->isPermanent($u)
-                    ];
-                })->toArray()
-            ]);
-        }
-
-        $permanentUsers = $users->filter(fn($u) => $this->isPermanent($u));
-        $temporaryUsers = $users->filter(fn($u) => !$this->isPermanent($u));
-
-        Log::info('Répartition des utilisateurs', [
-            'societe_id' => $societeId,
-            'total_users' => $users->count(),
-            'permanent_users' => $permanentUsers->count(),
-            'temporary_users' => $temporaryUsers->count(),
-            'inactive_users' => $inactiveUsers->count()
-        ]);
-
-        return [
-            'all' => $users,
-            'permanent' => $permanentUsers,
-            'temporary' => $temporaryUsers,
-            'inactive' => $inactiveUsers,
-        ];
+        // Conserver la signature publique pour compatibilité, mais déléguer au service
+        return (new PresenceUserService())->getPresenceUserCollections($societeId, $this->excludedUserIds);
     }
 
     /**
@@ -209,7 +289,9 @@ private function col(int $i): string {
     $sheet->mergeCells("A{$totalsRow}:{$labelEndLetter}{$totalsRow}");
 
     // For permanents, total columns: Absences, Jour Recup, Congés, Total Jours Travaillés, Heures Supp., Heures Normales
-    $endCol    = $isPermanent ? ($presenceEndCol + 6) : ($presenceEndCol + 2); // temporaries: Heures Normales, HS25, HS50
+    // Fin de zone numérique (présence + totaux)
+    // Permanents: +6 colonnes de totaux; Temporaires: +3 (HN, HS25, HS50)
+    $endCol    = $isPermanent ? ($presenceEndCol + 6) : ($presenceEndCol + 3);
         $endLetter = Coordinate::stringFromColumnIndex($endCol);
 
         if (!$isPermanent) {
@@ -535,8 +617,8 @@ private function col(int $i): string {
                 ->get()
                 ->all();
 
-            // Appliquer le groupement des pointages de nuit
-            $groupedPointages = $this->groupNightShiftPointages($allUserPointages, $user->id, $dateRange);
+            // Appliquer le groupement des pointages de nuit (service réutilisable)
+            $groupedPointages = TimeCalculationService::groupNightShiftPointages($allUserPointages, $user->id, $dateRange);
             
             // Organiser les pointages groupés par date pour traitement jour par jour
             $pointagesByDate = [];
@@ -567,11 +649,12 @@ private function col(int $i): string {
 
                 $hasPresent = false;
                 foreach ($pointages as $pt) {
-                    if (in_array($pt->statutJour, ['present','retard'])) $hasPresent = true;
+                    $stRaw = (string)($pt->statutJour ?? '');
+                    if (preg_match('/pr[eé]sent|retard/i', $stRaw)) { $hasPresent = true; }
                 }
 
-                $totalDailyHours = $this->computeDailyTotalHours($pointages);
-                $nightBaseHours  = $this->calculateNightBaseHours($pointages);
+                $totalDailyHours = TimeCalculationService::computeDailyTotalHoursForPermanent($pointages);
+                $nightBaseHours  = TimeCalculationService::calculateNightBaseHours($pointages);
 
                 if ($conge) {
                     // Compter le congé
@@ -604,15 +687,17 @@ private function col(int $i): string {
                         $presence[] = '';
                     }
                 } else {
-                    // Remplacer 'P' par heures réelles de travail
-                    $presence[] = $totalDailyHours;
-                    if ($dayOfWeek != 0) $joursTravailles += 1;
-                    // Permanents: HS si > 8h (au lieu de > 9h)
-                    if ($totalDailyHours > 8 && $nightBaseHours < 8) {
-                        $heuresSupp += ($totalDailyHours - 8);
+                    // Présence travaillée: si heures calculées > 0, mettre les heures, sinon marquer 'P'
+                    $presence[] = ($totalDailyHours > 0) ? $totalDailyHours : 'P';
+                    if ($totalDailyHours > 0) {
+                        if ($dayOfWeek != 0) $joursTravailles += 1;
+                        // Permanents: HS si > 8h (au lieu de > 9h) et base nuit < 8h
+                        if ($totalDailyHours > 8 && $nightBaseHours < 8) {
+                            $heuresSupp += ($totalDailyHours - 8);
+                        }
+                        if ($dayOfWeek == 0) $recup += 1;
+                        $totalHeures += $totalDailyHours;
                     }
-                    if ($dayOfWeek == 0) $recup += 1;
-                    $totalHeures += $totalDailyHours;
                 }
 
                 $currentDate->modify('+1 day');
@@ -645,8 +730,8 @@ private function col(int $i): string {
                 ->get()
                 ->all();
 
-            // Appliquer le groupement des pointages de nuit
-            $groupedPointages = $this->groupNightShiftPointages($allUserPointages, $user->id, $dateRange);
+            // Appliquer le groupement des pointages de nuit (service réutilisable)
+            $groupedPointages = TimeCalculationService::groupNightShiftPointages($allUserPointages, $user->id, $dateRange);
             
             // Organiser les pointages groupés par date pour traitement jour par jour
             $pointagesByDate = [];
@@ -667,6 +752,13 @@ private function col(int $i): string {
                 // Utiliser les pointages groupés pour cette date
                 $pointages = $pointagesByDate[$dateStr] ?? [];
 
+                // Détecter présence déclarée même sans heures
+                $hasPresent = false;
+                foreach ($pointages as $pt) {
+                    $stRaw = (string)($pt->statutJour ?? '');
+                    if (preg_match('/pr[eé]sent|retard/i', $stRaw)) { $hasPresent = true; }
+                }
+
                 $conge = DB::table('absence_requests')
                     ->where('user_id', $user->id)
                     ->whereIn('type', ['Congé', 'maladie'])
@@ -678,17 +770,20 @@ private function col(int $i): string {
                 if ($conge) {
                     $presence[] = ($conge->type === 'maladie') ? 'M' : 'C';
                 } else {
-                            // build presence cell
-                            $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pointages);
-                            $presence[] = $daily;
-                            $totalHeures += $daily;
-                            if ($daily > 0) {
-                                if ($dayOfWeek == 0 || $isHoliday) {
-                                    $heuresSupp += $daily; // tout le jour
-                                } elseif ($daily > 9) {
-                                    $heuresSupp += ($daily - 9);
-                                }
-                            }
+                    // build presence cell
+                    $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pointages);
+                    if ($daily > 0) {
+                        $presence[] = $daily;
+                        $totalHeures += $daily;
+                        if ($dayOfWeek == 0 || $isHoliday) {
+                            $heuresSupp += $daily; // tout le jour
+                        } elseif ($daily > 9) {
+                            $heuresSupp += ($daily - 9);
+                        }
+                    } else {
+                        // Si déclaré présent mais aucune heure valide, marquer 'P' pour visualiser la présence
+                        $presence[] = $hasPresent ? 'P' : '';
+                    }
                 }
                 $currentDate->modify('+1 day');
             }
@@ -1677,7 +1772,7 @@ private function col(int $i): string {
                 return !empty($pt->heureEntree) && !empty($pt->heureSortie);
             });
             $dailyHours = $hasValidInOut ? TimeCalculationService::computeDailyTotalHoursForTemporary($dayPointages->all()) : 0;
-            $nightBaseHours = $hasValidInOut ? $this->calculateNightBaseHours($dayPointages->all()) : 0;
+            $nightBaseHours = $hasValidInOut ? TimeCalculationService::calculateNightBaseHours($dayPointages->all()) : 0;
 
             if ($dailyHours > 0 && $hasValidInOut) {
                 $hasWorked = true;
@@ -1808,12 +1903,13 @@ private function col(int $i): string {
 
             if (!$conge && $pointages->count() > 0) {
                 $hasPresent = $pointages->contains(function($pt){
-                    return in_array($pt->statutJour, ['present','retard'], true);
+                    $st = strtolower(trim((string)($pt->statutJour ?? '')));
+                    return in_array($st, ['present','retard'], true);
                 });
 
                 if ($hasPresent) {
                     $dailyHours = TimeCalculationService::computeDailyTotalHoursForTemporary($pointages);
-                    $nightBaseHours = $this->calculateNightBaseHours($pointages);
+                    $nightBaseHours = TimeCalculationService::calculateNightBaseHours($pointages);
 
                     if ($dailyHours > 0) {
                         $hasWorked = true;
@@ -2219,9 +2315,12 @@ private function col(int $i): string {
                     ->whereDate('date', $dateStr)
                     ->get();
 
-                if ($pointages->count() > 0 && $pointages->contains(fn($pt) => in_array($pt->statutJour, ['present','retard'], true))) {
+                if ($pointages->count() > 0 && $pointages->contains(function($pt){
+                    $stRaw = (string)($pt->statutJour ?? '');
+                    return preg_match('/pr[eé]sent|retard/i', $stRaw) === 1;
+                })) {
                     $dailyHours = TimeCalculationService::computeDailyTotalHoursForTemporary($pointages);
-                    $nightBaseHours = $this->calculateNightBaseHours($pointages);
+                    $nightBaseHours = TimeCalculationService::calculateNightBaseHours($pointages);
 
                     if ($dailyHours > 0) {
                         $hasWorked = true;
@@ -2418,39 +2517,9 @@ private function col(int $i): string {
      * Vérifier si un utilisateur a des pointages dans la période donnée
      */
     private function hasPointagesInPeriod($userId, $dateRange)
-{
-    $startDate = $dateRange['startDate']->format('Y-m-d');
-    $endDate   = $dateRange['endDate']->format('Y-m-d');
-
-    // Utiliser whereDate pour inclure TOUT le dernier jour
-    $exists = DB::table('pointages')
-        ->where('user_id', $userId)
-        ->whereDate('date', '>=', $startDate)
-        ->whereDate('date', '<=', $endDate)
-        ->exists();
-
-    if ($exists) {
-        // logging facultatif
-        $user = DB::table('users')->find($userId);
-        $samplePointages = DB::table('pointages')
-            ->where('user_id', $userId)
-            ->whereDate('date', '>=', $startDate)
-            ->whereDate('date', '<=', $endDate)
-            ->select('date', 'heureEntree', 'heureSortie', 'statutJour')
-            ->orderBy('date')
-            ->limit(3)
-            ->get();
-
-        Log::info("🔍 UTILISATEUR (actif/inactif) AVEC POINTAGES", [
-            'user_id' => $userId,
-            'user_name' => ($user->name ?? 'N/A') . ' ' . ($user->prenom ?? ''),
-            'period' => $startDate . ' to ' . $endDate,
-            'sample_pointages' => $samplePointages->toArray()
-        ]);
+    {
+        return TimeCalculationService::hasPointagesInPeriod((int)$userId, $dateRange);
     }
-
-    return $exists;
-}
 
     /**
      * Fonction de test pour vérifier la détection des pointages de nuit
@@ -2469,7 +2538,7 @@ private function col(int $i): string {
             ->get()
             ->all();
 
-        $grouped = $this->groupNightShiftPointages($pointages, $userId, $dateRange);
+    $grouped = TimeCalculationService::groupNightShiftPointages($pointages, $userId, $dateRange);
         
         return [
             'original_count' => count($pointages),

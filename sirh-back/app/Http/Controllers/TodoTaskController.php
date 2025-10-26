@@ -235,9 +235,10 @@ class TodoTaskController extends Controller
                     ->values()
                     ->all();
             }
+        } elseif (array_key_exists('assigned_to', $data)) {
+            $assigneeIds = $data['assigned_to'] ? [(int) $data['assigned_to']] : [];
+            $shouldSyncAssignees = true;
         }
-        // Note: Removed the elseif clause that was forcing sync when only assigned_to was in data
-        // This was causing assignees to be cleared when closing tasks that only sent status updates
 
         if ($assigneeIds !== null) {
             $data['assigned_to'] = $assigneeIds[0] ?? null;

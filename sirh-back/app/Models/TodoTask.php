@@ -63,17 +63,19 @@ class TodoTask extends Model
                 }
             }
             
-            // Check for completion notifications
+            // Notifications on update are dispatched by the controller
+            // where we can accurately detect new assignees and primary changes.
             if ($todoTask->wasChanged('pourcentage') || $todoTask->wasChanged('status')) {
                 $status = strtolower((string)$todoTask->status);
                 if ($status === 'terminée' || $status === 'terminee' || (is_numeric($todoTask->pourcentage) && (int)$todoTask->pourcentage >= 100)) {
                     $sync = (bool) config('twilio.sync_on_task_events', false);
                     if ($sync) {
-                        // Use dispatchSync directly - afterCommit seems to cause issues in observers
-                        \App\Jobs\SendTaskCompletedNotifications::dispatchSync($todoTask->id);
+                        $taskId = $todoTask->id;
+                        DB::afterCommit(function () use ($taskId) {
+                            \App\Jobs\SendTaskCompletedNotifications::dispatchSync($taskId);
+                        });
                     } else {
-                        // Use dispatch without afterCommit - let Laravel handle the transaction
-                        \App\Jobs\SendTaskCompletedNotifications::dispatch($todoTask->id);
+                        \App\Jobs\SendTaskCompletedNotifications::dispatch($todoTask->id)->afterCommit();
                     }
                 }
             }

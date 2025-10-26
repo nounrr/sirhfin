@@ -4,12 +4,15 @@ namespace App\Services;
 
 use Twilio\Rest\Client;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use Carbon\Carbon;
 use Throwable;
 
 class TwilioService
 {
     protected array $config;
     private ?string $lastError = null;
+    private const WA_BLOCK_CACHE_KEY = 'twilio:wa:blocked_until';
 
     public function __construct(private Client $client, array $config = [])
     {
@@ -39,6 +42,10 @@ class TwilioService
     public function sendWhatsApp(string $to, string $message): bool
     {
         try {
+            if ($this->isWaBlocked()) {
+                Log::warning('Twilio WhatsApp skipped: daily limit active');
+                return false;
+            }
             $from = $this->config['whatsapp_from'] ?? null;
             if (!$from) {
                 throw new \RuntimeException('Twilio WhatsApp from number not configured');
@@ -53,6 +60,10 @@ class TwilioService
             return true;
         } catch (Throwable $e) {
             $this->lastError = $e->getMessage();
+            if ($this->isDailyLimitError($e)) {
+                $until = $this->blockWaUntilMidnight();
+                Log::warning('Twilio WhatsApp daily limit reached; blocking until '.$until->toDateTimeString());
+            }
             Log::error('Twilio WhatsApp error: '.$e->getMessage(), ['exception' => $e]);
             return false;
         }
@@ -67,6 +78,10 @@ class TwilioService
     public function sendWhatsAppTemplate(string $to, string $contentSid, array|string $variables = []): bool
     {
         try {
+            if ($this->isWaBlocked()) {
+                Log::warning('Twilio WhatsApp skipped (template): daily limit active');
+                return false;
+            }
             $from = $this->config['whatsapp_from'] ?? null;
             if (!$from) {
                 throw new \RuntimeException('Twilio WhatsApp from number not configured');
@@ -96,6 +111,10 @@ class TwilioService
             return true;
         } catch (Throwable $e) {
             $this->lastError = $e->getMessage();
+            if ($this->isDailyLimitError($e)) {
+                $until = $this->blockWaUntilMidnight();
+                Log::warning('Twilio WhatsApp daily limit reached (template); blocking until '.$until->toDateTimeString());
+            }
             Log::error('Twilio WhatsApp template error: '.$e->getMessage(), ['exception' => $e]);
             return false;
         }
@@ -140,5 +159,50 @@ class TwilioService
     public function getLastError(): ?string
     {
         return $this->lastError;
+    }
+
+    /**
+     * Determine if WhatsApp sending is currently blocked due to hitting the daily limit.
+     */
+    private function isWaBlocked(): bool
+    {
+        $untilTs = Cache::get(self::WA_BLOCK_CACHE_KEY);
+        if (!$untilTs) {
+            return false;
+        }
+        return Carbon::now()->timestamp < (int)$untilTs;
+    }
+
+    /**
+     * Mark WhatsApp sending as blocked until the next midnight (local app timezone).
+     * Returns the Carbon instance representing the unblock moment.
+     */
+    private function blockWaUntilMidnight(): Carbon
+    {
+        $now = Carbon::now();
+        $until = $now->copy()->addDay()->startOfDay();
+        Cache::put(self::WA_BLOCK_CACHE_KEY, $until->timestamp, $until);
+        return $until;
+    }
+
+    /**
+     * Heuristic to detect Twilio daily limit / rate limit errors to avoid spamming the API.
+     */
+    private function isDailyLimitError(Throwable $e): bool
+    {
+        // Twilio RestException typically contains HTTP 429 and code 63038 for daily messages limit
+        $msg = strtolower($e->getMessage() ?? '');
+        if (str_contains($msg, 'daily messages limit') || str_contains($msg, 'http 429')) {
+            return true;
+        }
+        // Some SDK versions expose properties; avoid hard dependency
+        if ($e instanceof \Twilio\Exceptions\RestException) {
+            try {
+                if (method_exists($e, 'getStatusCode') && (int) $e->getStatusCode() === 429) {
+                    return true;
+                }
+            } catch (\Throwable) {}
+        }
+        return false;
     }
 }
