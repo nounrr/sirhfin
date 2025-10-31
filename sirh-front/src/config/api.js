@@ -1,7 +1,7 @@
 const apiUrl = import.meta.env.VITE_API_URL_API;
-const API_URL = apiUrl+'api';
-// const API_URL = apiUrl+'public/api';
-
+// const API_URL = apiUrl+'api';
+const API_URL = apiUrl+'public/api';
+// 
 export const API_ENDPOINTS = {
   // Auth
   AUTH: {

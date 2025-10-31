@@ -835,20 +835,49 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THICK]]
         ]);
         $row += 2;
-        // Générer les en-têtes de mois (12 mois de l'année courante)
+        // Récupérer le mois de la période exportée
+        $exportMonth = $dateRange['startDate']->format('n'); // Numéro du mois (1-12)
+        $exportYear = $dateRange['startDate']->format('Y');
         $currentYear = date('Y');
-        $monthHeaders = [];
+        
+        // Générer les en-têtes de mois (12 mois de l'année courante)
+        // Le mois exporté aura 2 colonnes (DB et EXCEL), les autres 1 seule colonne
+        $monthHeaders = [''];  // Première colonne vide pour les libellés
+        $monthMapping = [];    // Map pour savoir quelle colonne correspond à quel mois
+        $colIndex = 2;         // Commence à la colonne B
+        
         for ($m = 1; $m <= 12; $m++) {
-            $monthHeaders[] = date('M-y', mktime(0, 0, 0, $m, 1, $currentYear));
+            $monthName = date('M-y', mktime(0, 0, 0, $m, 1, $currentYear));
+            
+            if ($m == $exportMonth && $exportYear == $currentYear) {
+                // Mois exporté : 2 colonnes
+                $monthHeaders[] = $monthName . ' - DB';
+                $monthHeaders[] = $monthName . ' - EXCEL';
+                $monthMapping[$m] = ['db' => $colIndex, 'excel' => $colIndex + 1];
+                $colIndex += 2;
+            } else {
+                // Autres mois : 1 seule colonne
+                $monthHeaders[] = $monthName;
+                $monthMapping[$m] = ['db' => $colIndex];
+                $colIndex += 1;
+            }
         }
+        
+        // Récupérer toutes les données de charge_personnels pour cette société et cette année
+        $chargeData = DB::table('charge_personnels')
+            ->where('societe_id', $societeId)
+            ->whereYear('mois', $currentYear)
+            ->get()
+            ->keyBy(function($item) {
+                return date('n', strtotime($item->mois)); // Index par numéro de mois (1-12)
+            });
+        
         // En-têtes du tableau
-        $headers = [''];  // Première colonne vide pour les libellés
-        $headers = array_merge($headers, $monthHeaders);
-        foreach ($headers as $index => $header) {
+        foreach ($monthHeaders as $index => $header) {
             $colLetter = Coordinate::stringFromColumnIndex($index + 1);
             $sheet->setCellValue($colLetter . $row, $header);
         }
-        $lastCol = Coordinate::stringFromColumnIndex(count($headers));
+        $lastCol = Coordinate::stringFromColumnIndex(count($monthHeaders));
         $sheet->getStyle('A' . $row . ':' . $lastCol . $row)->applyFromArray([
             'font' => ['bold' => true, 'size' => 12, 'color' => ['rgb' => 'FFFFFF']],
             'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
@@ -856,74 +885,106 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
         ]);
         $row++;
-        // Lignes de données selon l'image
+        
+        // Lignes de données : catégories simples
         $dataRows = [
-            'PERMANENT',
-            'CHARGES',
-            'TEMPORAIRES', 
-            'CHARGES',
+            'SALAIRE PERMANENT',
+            'CHARGES PERMANENT',
+            'SALAIRE TEMPORAIRE',
+            'CHARGES TEMPORAIRE',
             'AUTRES CHARGES RH',
             'TOTAL CHARGE PERSONNEL'
         ];
-        // Calculer les montants pour chaque ligne selon chaque mois
+        
+        // Remplir les montants pour chaque ligne selon chaque mois
         $startRowData = $row;
         foreach ($dataRows as $index => $rowLabel) {
             $sheet->setCellValue('A' . $row, $rowLabel);
-            if ($rowLabel === 'PERMANENT') {
-                // Calculer pour chaque mois
-                for ($col = 2; $col <= count($headers); $col++) {
-                    $colLetter = Coordinate::stringFromColumnIndex($col);
-                    $monthIndex = $col - 2; // Index du mois (0-11)
-                    $monthNumber = $monthIndex + 1; // Numéro du mois (1-12)
-                    $totalSalaireNet = $this->calculatePermanentSalaryTotalForMonth($societeId, $currentYear, $monthNumber);
-                    // Utiliser la valeur numérique brute (sans arrondi) pour permettre les calculs Excel
-                    $sheet->setCellValue($colLetter . $row, $totalSalaireNet);
-                }
-            } elseif ($rowLabel === 'CHARGES' && isset($dataRows[$index - 1]) && $dataRows[$index - 1] === 'PERMANENT') {
-                // Charges permanents: 27% des salaires permanents
-                for ($col = 2; $col <= count($headers); $col++) {
-                    $colLetter = Coordinate::stringFromColumnIndex($col);
-                    $permanentRow = $row - 1;
-                    $sheet->setCellValue($colLetter . $row, "=". $colLetter . $permanentRow . "*0.27");
-                }
-            } elseif ($rowLabel === 'TEMPORAIRES') {
-                // Calculer pour chaque mois
-                for ($col = 2; $col <= count($headers); $col++) {
-                    $colLetter = Coordinate::stringFromColumnIndex($col);
-                    $monthIndex = $col - 2; // Index du mois (0-11)
-                    $monthNumber = $monthIndex + 1; // Numéro du mois (1-12)
-                    $totalCoutTemporaires = $this->calculateTemporaryCostTotalForMonth($societeId, $currentYear, $monthNumber);
-                    // Utiliser la valeur numérique brute (sans arrondi) pour permettre les calculs Excel
-                    $sheet->setCellValue($colLetter . $row, $totalCoutTemporaires);
-                }
-            } elseif ($rowLabel === 'CHARGES' && isset($dataRows[$index - 1]) && $dataRows[$index - 1] === 'TEMPORAIRES') {
-                // Charges temporaires: 27% des coûts temporaires
-                for ($col = 2; $col <= count($headers); $col++) {
-                    $colLetter = Coordinate::stringFromColumnIndex($col);
-                    $temporaireRow = $row - 1;
-                    $sheet->setCellValue($colLetter . $row, "=". $colLetter . $temporaireRow . "*0.27");
-                }
-            } elseif ($rowLabel === 'AUTRES CHARGES RH') {
-                // Laisser à 0 (valeur numérique)
-                for ($col = 2; $col <= count($headers); $col++) {
-                    $colLetter = Coordinate::stringFromColumnIndex($col);
-                    $sheet->setCellValue($colLetter . $row, 0);
-                }
-            } elseif ($rowLabel === 'TOTAL CHARGE PERSONNEL') {
-                // Formule Excel: somme des lignes précédentes
-                for ($col = 2; $col <= count($headers); $col++) {
-                    $colLetter = Coordinate::stringFromColumnIndex($col);
-                    $permanentRow = $startRowData;
-                    $chargesPermanentRow = $startRowData + 1;
-                    $temporaireRow = $startRowData + 2;
-                    $chargesTemporaireRow = $startRowData + 3;
-                    $autresChargesRow = $startRowData + 4;
-                    $sheet->setCellValue($colLetter . $row, 
-                        "={$colLetter}{$permanentRow}+{$colLetter}{$chargesPermanentRow}+{$colLetter}{$temporaireRow}+{$colLetter}{$chargesTemporaireRow}+{$colLetter}{$autresChargesRow}"
+            
+            // Pour chaque mois (12 mois)
+            for ($m = 1; $m <= 12; $m++) {
+                $mapping = $monthMapping[$m];
+                $colDB = $mapping['db'];
+                $colLetterDB = Coordinate::stringFromColumnIndex($colDB);
+                
+                // Si le mois a une colonne EXCEL (mois exporté uniquement)
+                $hasExcel = isset($mapping['excel']);
+                $colLetterExcel = $hasExcel ? Coordinate::stringFromColumnIndex($mapping['excel']) : null;
+                
+                if ($rowLabel === 'SALAIRE PERMANENT') {
+                    // Colonne DB: valeur depuis charge_personnels
+                    $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->salaire_permanent : 0;
+                    $sheet->setCellValue($colLetterDB . $row, $value);
+                    
+                    // Colonne EXCEL: formule (uniquement pour mois exporté)
+                    if ($hasExcel) {
+                        $sheet->setCellValue($colLetterExcel . $row, "=IFERROR(SUM('Salaire Permanent'!G:G),0)");
+                    }
+                    
+                } elseif ($rowLabel === 'CHARGES PERMANENT') {
+                    // Colonne DB: valeur depuis charge_personnels
+                    $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->charge_salaire_permanent : 0;
+                    $sheet->setCellValue($colLetterDB . $row, $value);
+                    
+                    // Colonne EXCEL: 27% du salaire permanent EXCEL (ligne précédente)
+                    if ($hasExcel) {
+                        $permanentRow = $startRowData;
+                        $sheet->setCellValue($colLetterExcel . $row, "={$colLetterExcel}{$permanentRow}*0.27");
+                    }
+                    
+                } elseif ($rowLabel === 'SALAIRE TEMPORAIRE') {
+                    // Colonne DB: valeur depuis charge_personnels
+                    $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->salaire_temporaire : 0;
+                    $sheet->setCellValue($colLetterDB . $row, $value);
+                    
+                    // Colonne EXCEL: formule (uniquement pour mois exporté)
+                    if ($hasExcel) {
+                        $sheet->setCellValue($colLetterExcel . $row, "=IFERROR(SUM('Salaire Temporaire'!K:K),0)");
+                    }
+                    
+                } elseif ($rowLabel === 'CHARGES TEMPORAIRE') {
+                    // Colonne DB: valeur depuis charge_personnels
+                    $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->charge_salaire_temp : 0;
+                    $sheet->setCellValue($colLetterDB . $row, $value);
+                    
+                    // Colonne EXCEL: 27% du salaire temporaire EXCEL
+                    if ($hasExcel) {
+                        $temporaireRow = $startRowData + 2;
+                        $sheet->setCellValue($colLetterExcel . $row, "={$colLetterExcel}{$temporaireRow}*0.27");
+                    }
+                    
+                } elseif ($rowLabel === 'AUTRES CHARGES RH') {
+                    // Colonne DB: valeur depuis charge_personnels
+                    $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->autres_charge : 0;
+                    $sheet->setCellValue($colLetterDB . $row, $value);
+                    
+                    // Colonne EXCEL: référence à la valeur DB
+                    if ($hasExcel) {
+                        $sheet->setCellValue($colLetterExcel . $row, "={$colLetterDB}{$row}");
+                    }
+                    
+                } elseif ($rowLabel === 'TOTAL CHARGE PERSONNEL') {
+                    $permRow = $startRowData;
+                    $chargPermRow = $startRowData + 1;
+                    $tempRow = $startRowData + 2;
+                    $chargTempRow = $startRowData + 3;
+                    $autresRow = $startRowData + 4;
+                    
+                    // Colonne DB: somme des DB
+                    $sheet->setCellValue($colLetterDB . $row, 
+                        "={$colLetterDB}{$permRow}+{$colLetterDB}{$chargPermRow}+{$colLetterDB}{$tempRow}+{$colLetterDB}{$chargTempRow}+{$colLetterDB}{$autresRow}"
                     );
+                    
+                    // Colonne EXCEL: somme des EXCEL (uniquement pour mois exporté)
+                    if ($hasExcel) {
+                        $sheet->setCellValue($colLetterExcel . $row, 
+                            "={$colLetterExcel}{$permRow}+{$colLetterExcel}{$chargPermRow}+{$colLetterExcel}{$tempRow}+{$colLetterExcel}{$chargTempRow}+{$colLetterExcel}{$autresRow}"
+                        );
+                    }
                 }
             }
-            // Style spécial pour la ligne total
+            
+            // Style pour la ligne
             if ($rowLabel === 'TOTAL CHARGE PERSONNEL') {
                 $sheet->getStyle('A' . $row . ':' . $lastCol . $row)->applyFromArray([
                     'font' => ['bold' => true],
@@ -937,13 +998,37 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
             }
             $row++;
         }
+        
         // Appliquer format d'affichage (display-only) pour toutes les cellules numériques du bloc données
         $endRowData = $row - 1;
         if ($endRowData >= $startRowData) {
             $this->formatRange($sheet, 'B' . $startRowData . ':' . $lastCol . $endRowData, 0);
         }
+        
+        // Colorer les colonnes DB et EXCEL pour le mois exporté dans l'en-tête
+        if ($exportYear == $currentYear) {
+            $mapping = $monthMapping[$exportMonth];
+            $colDB = $mapping['db'];
+            $colExcel = isset($mapping['excel']) ? $mapping['excel'] : null;
+            
+            if ($colExcel) {
+                $colLetterDB = Coordinate::stringFromColumnIndex($colDB);
+                $colLetterExcel = Coordinate::stringFromColumnIndex($colExcel);
+                
+                // Colonne DB en bleu
+                $sheet->getStyle($colLetterDB . ($startRowData - 1))->applyFromArray([
+                    'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'B4C7E7']]
+                ]);
+                
+                // Colonne EXCEL en vert
+                $sheet->getStyle($colLetterExcel . ($startRowData - 1))->applyFromArray([
+                    'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'C6E0B4']]
+                ]);
+            }
+        }
+        
         // Auto-ajuster les colonnes
-        for ($c = 1; $c <= count($headers); $c++) {
+        for ($c = 1; $c <= count($monthHeaders); $c++) {
             $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
         }
         $sheet->freezePane('B4');
@@ -1015,7 +1100,7 @@ private function createRecapSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $spreads
 
     // Feuille récap
     $recap = $spreadsheet->createSheet();
-    $recap->setTitle('Récap');
+    $recap->setTitle('Récap Departements');
 
     $r = 1;
     $recap->setCellValue('A'.$r, 'RÉCAPITULATIF (agrégation feuilles — 7 métriques)');

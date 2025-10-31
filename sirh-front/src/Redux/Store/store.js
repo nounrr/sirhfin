@@ -19,6 +19,7 @@ import leaveReducer from '../Slices/leaveSlice';
 import holidayReducer from '../Slices/holidaySlice';
 import auditReducer from '../Slices/auditSlice';
 import salaireReducer from '../Slices/salaireSlice';
+import chargePersonnelReducer from '../Slices/chargePersonnelSlice';
 export const store = configureStore({
   reducer: {
     auth: authReducer,
@@ -40,5 +41,6 @@ export const store = configureStore({
     holidays: holidayReducer,
     audits: auditReducer,
     salaires: salaireReducer,
+    chargePersonnels: chargePersonnelReducer,
   }
 });

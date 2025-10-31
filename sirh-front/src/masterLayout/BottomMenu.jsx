@@ -77,6 +77,14 @@ const menuData = [
     ]
   },
   {
+    icon: "fluent:money-24-filled",
+    label: "Paie",
+    options: [
+      { icon: "fluent:money-24-filled", to: "/salaires", label: "Salaires", roles: ["RH"] },
+      { icon: "fluent:money-calculator-24-regular", to: "/charges-personnel", label: "Charge Personnel", roles: ["RH"] }
+    ]
+  },
+  {
     icon: "fluent:news-24-filled",
     label: "Communications",
     options: [

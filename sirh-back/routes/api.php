@@ -31,6 +31,7 @@ use App\Http\Controllers\JourFerieController;
 use App\Http\Controllers\CongeExportController;
 use App\Http\Controllers\AuditController;
 use App\Http\Controllers\SalaireController;
+use App\Http\Controllers\ChargePersonnelController;
 use App\Http\Middleware\RoleMiddleware;
 
 Route::resource('jours-feries', JourFerieController::class);
@@ -52,6 +53,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/projects/{id}', [App\Http\Controllers\ProjectController::class, 'destroy']);
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/me', [AuthController::class, 'me']);
+
+    // Charge Personnel CRUD
+    Route::apiResource('charge-personnels', ChargePersonnelController::class);
     
     // Routes d'audit
     Route::prefix('audits')->group(function () {

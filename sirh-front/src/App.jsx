@@ -48,6 +48,7 @@ import LeaveBalancesPage from './Pages/LeaveBalancesPage';
 import AuditPage from './Pages/AuditPage';
 import ErrorBoundary from './components/ErrorBoundary';
 import SalairePage from './components/SalairePage';
+import ChargePersonnelPage from './Pages/ChargePersonnelPage';
 import PrivateRouteWithRole from './PrivateRouteWithRole';
 //fetch slices
 
@@ -372,8 +373,17 @@ const roles = useSelector((state) => state.auth.roles || []);
           <Route 
             path="/salaires" 
             element={
-              <PrivateRouteWithRole allowedRoles={['RH', 'Gest_RH']}>
+              <PrivateRouteWithRole allowedRoles={['RH']}>
                 <SalairePage />
+              </PrivateRouteWithRole>
+            } 
+          />
+          {/* Charge Personnel - Accès RH uniquement */}
+          <Route 
+            path="/charges-personnel" 
+            element={
+              <PrivateRouteWithRole allowedRoles={['RH']}>
+                <ChargePersonnelPage />
               </PrivateRouteWithRole>
             } 
           />

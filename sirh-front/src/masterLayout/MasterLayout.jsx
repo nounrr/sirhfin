@@ -544,13 +544,27 @@ useEffect(() => {
             </li>
   )}
 
-  {/* Gestion des Salaires - RH uniquement */}
+  {/* Paie - RH uniquement (sous-menu: Salaires, Charge Personnel) */}
   {roles.includes("RH") && (
-    <li>
-      <NavLink to="/salaires" className={(navData) => navData.isActive ? "active-page" : ""} onClick={handleLinkClick}>
+    <li className="dropdown">
+      <Link to="#">
         <Icon icon="fluent:money-24-filled" className="menu-icon" />
-        <span>Gestion des Salaires</span>
-      </NavLink>
+        <span>Paie</span>
+      </Link>
+      <ul className="sidebar-submenu">
+        <li>
+          <NavLink to="/salaires" className={(navData) => navData.isActive ? "active-page" : ""} onClick={handleLinkClick}>
+            <Icon icon="fluent:money-24-filled" className="circle-icon w-auto" />
+            Salaires
+          </NavLink>
+        </li>
+        <li>
+          <NavLink to="/charges-personnel" className={(navData) => navData.isActive ? "active-page" : ""} onClick={handleLinkClick}>
+            <Icon icon="fluent:money-calculator-24-regular" className="circle-icon w-auto" />
+            Charge Personnel
+          </NavLink>
+        </li>
+      </ul>
     </li>
   )}
 
