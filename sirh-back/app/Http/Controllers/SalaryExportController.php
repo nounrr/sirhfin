@@ -1,8 +1,6 @@
 <?php
-
 namespace App\Http\Controllers;
 use Illuminate\Support\Facades\Schema;
-
 use Illuminate\Http\Request;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
@@ -19,14 +17,11 @@ use App\Services\PresenceSheetService;
 use DateTime;
 use PhpOffice\PhpSpreadsheet\Style\NumberFormat;
 use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
-
 class SalaryExportController extends Controller
 {
     // Cache des statistiques des temporaires (heures totales, heures supp, jours travaillés)
     private array $temporaryStats = [];
-    
     // Fonction d'arrondi personnalisée : si décimale >= 0.5 arrondir vers le haut, sinon supprimer la décimale
-    
  private function formatRange($sheet, string $range, int $decimals = 0): void
 {
    $nbsp = "\xC2\xA0"; // espace insécable
@@ -35,9 +30,36 @@ class SalaryExportController extends Controller
         : "[$-fr-FR] #{$nbsp}##0";
     $sheet->getStyle($range)->getNumberFormat()->setFormatCode($fmt);
 }
-    // Fonction pour formater les nombres avec séparateur de milliers
-    
 
+// --- Helpers requis par createRecapSheet ---
+/** @var \PhpOffice\PhpSpreadsheet\Spreadsheet|null */
+private ?\PhpOffice\PhpSpreadsheet\Spreadsheet $currentSpreadsheet = null;
+
+private function col(int $n): string
+{
+    return \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($n);
+}
+
+private function spreadsheetHasSheetNamed($spreadsheet, string $name): ?\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet
+{
+    if (!$spreadsheet) return null;
+    $sheet = $spreadsheet->getSheetByName($name);
+    return $sheet ?: null;
+}
+
+/**
+ * Début des colonnes de jours de présence (mapping fixe, aligné avec MonthlyPresenceExportController)
+ * Permanents: A=Nom, B=Fonction, C=Département => présence en colonne 4 (D)
+ * Temporaires: A=Nom, B=Prénom, C=Fonction, D=Département => présence en colonne 5 (E)
+ */
+private function presenceStartCol(bool $isPermanent): int
+{
+    return $isPermanent ? 4 : 5;
+}
+
+
+
+    // Fonction pour formater les nombres avec séparateur de milliers
     // Fonction pour déterminer si un utilisateur est permanent
     private function isPermanent($user)
     {
@@ -46,21 +68,17 @@ class SalaryExportController extends Controller
                str_contains($typeContrat, 'permanent') ||
                str_contains($typeContrat, 'cdi');
     }
-
     public function export(Request $request)
     {
         // Étendre limites pour gros exports
         @set_time_limit(300);
         @ini_set('memory_limit', '512M');
-        
         $exportType = $this->determineExportType($request);
         $dateRange  = $this->calculateDateRange($request, $exportType);
         if (!$dateRange) {
             return response()->json(['error' => 'Paramètres de date requis'], 400);
         }
-
         $userAuth = Auth::user();
-        
         // Vérification des rôles pour l'accès aux feuilles salaires
         $userRoleRaw = (string)($userAuth->role ?? '');
         $userRole = strtolower(trim($userRoleRaw));
@@ -72,41 +90,30 @@ class SalaryExportController extends Controller
                 Log::warning('Impossible de récupérer les rôles Spatie', ['err'=>$e->getMessage()]);
             }
         }
-        
         // Vérifier l'accès aux feuilles salaires
         $exclusionList = ['gest_rh','rh_manager'];
         $shouldExclude = in_array($userRole, $exclusionList, true) || count(array_intersect($exclusionList, $spatieRoles))>0;
-        
         if ($shouldExclude) {
             return response()->json(['error' => 'Accès non autorisé aux données de salaires'], 403);
         }
-
         $spreadsheet = new Spreadsheet();
-
         /* ===================== FEUILLES PRÉSENCE (même logique que Monthly) ===================== */
         $presenceController = new MonthlyPresenceExportController();
         $presenceCollections = $presenceController->getPresenceUserCollections($userAuth->societe_id);
         $presenceCallbacks = $presenceController->getPresenceCallbacks();
-
         $presenceService = new PresenceSheetService();
         $presenceService->createPermanentSheet($spreadsheet, $dateRange, $presenceCollections['permanent'], $presenceCallbacks);
         $presenceService->createTemporarySheet($spreadsheet, $dateRange, $presenceCollections['temporary'], $presenceCallbacks);
-
         /* ===================== FEUILLE SALAIRE PERMANENTS ===================== */
         $this->createSalairePermanentSheet($spreadsheet, $userAuth->societe_id, $dateRange);
-
         /* ===================== FEUILLE SALAIRE TEMPORAIRES ===================== */
         $this->createSalaireTemporaireSheet($spreadsheet, $userAuth->societe_id, $dateRange);
-
         /* ===================== FEUILLE RECAP CHARGE PERSONNEL ===================== */
         $this->createRecapChargePersonnelSheet($spreadsheet, $userAuth->societe_id, $dateRange);
-
-        /* ===================== FEUILLE RECAP DÉPARTEMENTS ===================== */
-        $this->createRecapDepartementsSheet($spreadsheet, $userAuth->societe_id, $dateRange);
-
+        $this->currentSpreadsheet = $spreadsheet;
+        $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange);
         return $this->exportExcel($spreadsheet, $dateRange, 'Salaires');
     }
-
     /* ----------------------- Helpers: dates & type ----------------------- */
     private function determineExportType(Request $request)
     {
@@ -116,7 +123,6 @@ class SalaryExportController extends Controller
         if ($request->has('exportAll')) return 'all';
         return null;
     }
-
     private function calculateDateRange(Request $request, $exportType)
     {
         switch ($exportType) {
@@ -185,13 +191,11 @@ class SalaryExportController extends Controller
                 return null;
         }
     }
-
     private function createSalairePermanentSheet($spreadsheet, $societeId, $dateRange)
     {
         $sheet = new Worksheet($spreadsheet, 'Salaire Permanent');
         $spreadsheet->addSheet($sheet);
         $spreadsheet->setActiveSheetIndex($spreadsheet->getIndex($sheet));
-
         // Récupérer tous les employés permanents (y compris inactifs avec pointages)
         $allEmployes = DB::table('users')
             ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
@@ -205,12 +209,13 @@ class SalaryExportController extends Controller
             })
             ->select(
                 'users.id', 'users.name', 'users.prenom', 'users.fonction','users.statut',
-                'salaires.salaire_base', 'salaires.salaire_net',
+                DB::raw('MAX(salaires.salaire_base) as salaire_base'),
+                DB::raw('MAX(salaires.salaire_net) as salaire_net'),
                 'departements.nom as departement_nom'
             )
+            ->groupBy('users.id','users.name','users.prenom','users.fonction','users.statut','departements.nom')
             ->orderBy('users.name')
             ->get();
-
         // Filtrer les employés : actifs + inactifs avec pointages dans la période
         $employes = $allEmployes->filter(function($user) use ($dateRange) {
             $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
@@ -219,7 +224,6 @@ class SalaryExportController extends Controller
             }
             return true; // Utilisateurs actifs
         });
-
         // Titre principal
         $row = 1;
         $sheet->setCellValue('A' . $row, 'SALAIRES EMPLOYÉS PERMANENTS');
@@ -231,7 +235,6 @@ class SalaryExportController extends Controller
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THICK]]
         ]);
         $row += 2;
-
         // En-têtes principales (ligne 3)
         $sheet->setCellValue('A3', 'MATRICULES');
         $sheet->setCellValue('B3', 'NOMS ET PRÉNOMS');
@@ -239,24 +242,21 @@ class SalaryExportController extends Controller
         $sheet->setCellValue('D3', 'DÉPARTEMENT');
         $sheet->setCellValue('E3', 'TOTAL JOURS TRAVAILLÉS');
         $sheet->setCellValue('F3', 'CONGÉ');
-        
         // Fusionner la cellule "Salaires" (G3:J3)
         $sheet->mergeCells('G3:J3');
         $sheet->setCellValue('G3', 'SALAIRES');
-        
         // Fusionner "Prime d'ancienneté" (K3)
         $sheet->setCellValue('K3', "PRIME D'ANCIENNETÉ");
-        
         // Fusionner "Primes et indemnités" (L3:O3)
         $sheet->mergeCells('L3:O3');
         $sheet->setCellValue('L3', 'PRIMES ET INDEMNITÉS');
-        
         // Fusionner "CNSS Parts patronales" (P3:Q3)
         $sheet->mergeCells('P3:Q3');
         $sheet->setCellValue('P3', 'CNSS PARTS PATRONALES');
-        
-        $sheet->setCellValue('R3', 'COÛT TOTAL PAR SALARIÉS');
-
+    $sheet->setCellValue('R3', 'COÛT TOTAL PAR SALARIÉS');
+    // Colonnes helpers cachées pour heures mensuelles (permanents) afin d'alimenter les récapitulatifs
+    $sheet->setCellValue('S3', 'HN MOIS');
+    $sheet->setCellValue('T3', 'HS MOIS');
         // Sous-en-têtes (ligne 4)
         $sheet->setCellValue('A4', ''); // Matricules
         $sheet->setCellValue('B4', ''); // Noms
@@ -264,27 +264,23 @@ class SalaryExportController extends Controller
         $sheet->setCellValue('D4', ''); // Département
         $sheet->setCellValue('E4', ''); // Total Jours
         $sheet->setCellValue('F4', ''); // Congé
-        
         // Sous-cellules pour "Salaires"
         $sheet->setCellValue('G4', 'SALAIRE NET 26J');
         $sheet->setCellValue('H4', 'SALAIRE DE BASE');
         $sheet->setCellValue('I4', 'JOURNALIERS');
         $sheet->setCellValue('J4', 'MENSUELS');
-        
         $sheet->setCellValue('K4', ''); // Prime ancienneté
-        
         // Sous-cellules pour "Primes et indemnités"
         $sheet->setCellValue('L4', 'PANIER');
         $sheet->setCellValue('M4', 'REPRÉSENT.');
         $sheet->setCellValue('N4', 'TRANSP.');
         $sheet->setCellValue('O4', 'DÉPLACEMENT');
-        
         // Sous-cellules pour "CNSS Parts patronales"
         $sheet->setCellValue('P4', '8.98%');
         $sheet->setCellValue('Q4', '12.11%');
-        
-        $sheet->setCellValue('R4', ''); // Coût total
-
+    $sheet->setCellValue('R4', ''); // Coût total
+    $sheet->setCellValue('S4', ''); // HN helper
+    $sheet->setCellValue('T4', ''); // HS helper
         // Fusionner les cellules qui n'ont pas de sous-cellules (de ligne 3 à 4)
         $sheet->mergeCells('A3:A4');
         $sheet->mergeCells('B3:B4');
@@ -294,9 +290,8 @@ class SalaryExportController extends Controller
         $sheet->mergeCells('F3:F4');
         $sheet->mergeCells('K3:K4');
         $sheet->mergeCells('R3:R4');
-
         // Style des en-têtes
-        $sheet->getStyle('A3:R4')->applyFromArray([
+        $sheet->getStyle('A3:T4')->applyFromArray([
             'font' => ['bold' => true, 'size' => 10],
             'alignment' => [
                 'horizontal' => Alignment::HORIZONTAL_CENTER,
@@ -305,23 +300,28 @@ class SalaryExportController extends Controller
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'E8F4FD']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
         ]);
-
         // Ajouter AutoFilter pour les en-têtes
-        $sheet->setAutoFilter('A4:R4');
-
+    $sheet->setAutoFilter('A4:R4');
         $row = 5;
-
         // Ajouter les données des employés
         foreach ($employes as $emp) {
             // Calculer les jours travaillés et congés pour cet employé
             $statsEmploye = $this->calculateEmployeeStats($emp->id, $dateRange);
-            
+            // Normaliser le libellé département pour cohérence avec Monthly (UPPER TRIM, fallback NON AFFECTÉ)
+            $deptLabel = strtoupper(trim((string)($emp->departement_nom ?? '')));
+            if ($deptLabel === '' || $deptLabel === 'NON DEFINI' || $deptLabel === 'NON DÉFINI' || $deptLabel === 'NON-DEFINI') {
+                $deptLabel = 'NON AFFECTÉ';
+            }
+           $formulaJoursTravailles = sprintf(
+    "=IFERROR(XLOOKUP(B%d,'Employés Permanents'!A:A,'Employés Permanents'!AL:AL,0),0)",
+    $row
+);
             $data = [
                 $emp->id, // Matricule
                 strtoupper(trim(($emp->name ?? '') . ' ' . ($emp->prenom ?? ''))), // Noms et prénoms
                 $emp->fonction ?? '', // Fonction
-                $emp->departement_nom ?? 'Non défini', // Département
-                $statsEmploye['jours_travailles'], // Total Jours Travaillés
+                $deptLabel, // Département (normalisé)
+                null,
                 $statsEmploye['conges'], // Congé
                 ($emp->salaire_net ?? 0), // Salaire net 26j (valeur brute)
                 ($emp->salaire_base ?? 0), // Salaire de base (valeur brute)
@@ -336,20 +336,24 @@ class SalaryExportController extends Controller
                 '', // CNSS 12.11% (colonne vide)
                 ''  // Coût total (colonne vide)
             ];
-            
             $sheet->fromArray($data, null, 'A' . $row);
-            
+            $sheet->setCellValue('E' . $row, $formulaJoursTravailles);
+
+            // Calculer HN/HS mensuels (logique Monthly) et les poser dans S/T (helpers cachés)
+            $permanentStats = $this->getDataFromMonthlyExport($emp, $dateRange, true);
+            $hn = max(0, ($permanentStats['total_heures'] ?? 0) - ($permanentStats['heures_supp'] ?? 0));
+            $hs = max(0, ($permanentStats['heures_supp'] ?? 0));
+            $sheet->setCellValue('S'.$row, $hn);
+            $sheet->setCellValue('T'.$row, $hs);
             // Style alterné pour les lignes
             $fillColor = ($row % 2 === 0) ? 'F9F9F9' : 'FFFFFF';
-            $sheet->getStyle('A' . $row . ':R' . $row)->applyFromArray([
+            $sheet->getStyle('A' . $row . ':T' . $row)->applyFromArray([
                 'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
                 'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $fillColor]],
                 'alignment' => ['vertical' => Alignment::VERTICAL_CENTER]
             ]);
-            
             $row++;
         }
-
         // Appliquer format d'affichage (display-only)
         $firstDataRow = 5;
         $lastDataRow  = $row - 1;
@@ -360,28 +364,28 @@ class SalaryExportController extends Controller
             $this->formatRange($sheet, 'G' . $firstDataRow . ':H' . $lastDataRow, 0);
             // R (coût total) si rempli plus tard, garder format entier
             $this->formatRange($sheet, 'R' . $firstDataRow . ':R' . $lastDataRow, 0);
+            // Helpers HN/HS
+            $this->formatRange($sheet, 'S' . $firstDataRow . ':T' . $lastDataRow, 0);
         }
-
         // Auto-ajuster les colonnes
         foreach (range('A', 'R') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
-
+        // Cacher les colonnes helpers
+        $sheet->getColumnDimension('S')->setVisible(false);
+        $sheet->getColumnDimension('T')->setVisible(false);
         $sheet->freezePane('A5');
     }
-
     private function createSalaireTemporaireSheet($spreadsheet, $societeId, $dateRange)
     {
         $sheet = new Worksheet($spreadsheet, 'Salaire Temporaire');
         $spreadsheet->addSheet($sheet);
         $spreadsheet->setActiveSheetIndex($spreadsheet->getIndex($sheet));
-
         // Récupérer tous les temporaires (y compris inactifs) ayant au moins un pointage PRESENT ou RETARD dans la période
         $allTemporaires = DB::table('users')
             ->where('users.societe_id', $societeId)
             ->get()
             ->filter(function($u){ return !$this->isPermanent($u); });
-
         // Filtrer les temporaires : actifs + inactifs avec pointages dans la période
         $rawTemporaires = $allTemporaires->filter(function($user) use ($dateRange) {
             $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
@@ -390,37 +394,34 @@ class SalaryExportController extends Controller
             }
             return true; // Utilisateurs actifs
         });
-
         $ids = $rawTemporaires->pluck('id')->all();
         $employes = collect();
         if (!empty($ids)) {
-            $pointages = DB::table('pointages')
-    ->select('user_id')
-    ->whereIn('user_id', $ids)
-    ->whereDate('date', '>=', $dateRange['startDate']->format('Y-m-d'))
-    ->whereDate('date', '<=', $dateRange['endDate']->format('Y-m-d'))
-    ->whereIn('statutJour', ['present','retard'])
-    ->groupBy('user_id')
-    ->pluck('user_id')
-    ->toArray();
-
-
-            if (!empty($pointages)) {
+            // Utiliser le service pour déterminer les utilisateurs avec au moins un statut présent/retard
+            $presentUserIds = [];
+            foreach ($ids as $uid) {
+                $pts = TimeCalculationService::getUserPointagesGrouped((int)$uid, $dateRange);
+                foreach ($pts as $p) {
+                    $st = strtolower(trim((string)($p->statutJour ?? '')));
+                    if (preg_match('/pr[eé]sent|retard/i', $st)) { $presentUserIds[] = $uid; break; }
+                }
+            }
+            if (!empty($presentUserIds)) {
                 $employes = DB::table('users')
-                            ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
-                            ->leftJoin('salaires', 'users.id', '=', 'salaires.user_id')
-                    ->whereIn('users.id', $pointages)
+                    ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
+                    ->leftJoin('salaires', 'users.id', '=', 'salaires.user_id')
+                    ->whereIn('users.id', $presentUserIds)
                     ->select(
-                        'users.*',
-                                'salaires.salaire_base',
-                                DB::raw('COALESCE(salaires.panier, salaires.panier, 0) as panier'),
-                                'departements.nom as departement_nom'
+                        'users.id','users.name','users.prenom','users.fonction','users.statut',
+                        DB::raw('MAX(salaires.salaire_base) as salaire_base'),
+                        DB::raw('MAX(COALESCE(salaires.panier,0)) as panier'),
+                        'departements.nom as departement_nom'
                     )
+                    ->groupBy('users.id','users.name','users.prenom','users.fonction','users.statut','departements.nom')
                     ->orderBy('users.name')
                     ->get();
             }
         }
-
         // Titre principal
         $row = 1;
         $sheet->setCellValue('A' . $row, 'SALAIRES EMPLOYÉS TEMPORAIRES');
@@ -432,18 +433,15 @@ class SalaryExportController extends Controller
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THICK]]
         ]);
         $row += 2;
-
         // Ligne 3 (grandes cellules)
         // A: Nom & Prénom (fusion A3:A4), B: Fonction (fusion B3:B4)
         $sheet->setCellValue('A3', 'NOM ET PRÉNOM');
         $sheet->mergeCells('A3:A4');
         $sheet->setCellValue('B3', 'FONCTION');
         $sheet->mergeCells('B3:B4');
-
     // C: DEPARTEMENT (fusion C3:C4)
     $sheet->setCellValue('C3', 'DÉPARTEMENT');
     $sheet->mergeCells('C3:C4');
-
     // D-G: DÉTAIL DES HEURES -> Sous: Heures Normales / HS 25 / HS 50 / Total Heures
     $sheet->mergeCells('D3:G3');
     $sheet->setCellValue('D3', 'DÉTAIL DES HEURES');
@@ -451,21 +449,17 @@ class SalaryExportController extends Controller
     $sheet->setCellValue('E4', 'HS 25');
     $sheet->setCellValue('F4', 'HS 50');
     $sheet->setCellValue('G4', 'TOTAL HEURES');
-
     // H: Total Jours Travaillés (fusion H3:H4)
     $sheet->setCellValue('H3', 'TOTAL JOURS TRAVAILLÉS');
     $sheet->mergeCells('H3:H4');
-
     // I-J: COÛT -> Sous: Taux H / Prime de panier
     $sheet->mergeCells('I3:J3');
     $sheet->setCellValue('I3', 'COÛT');
     $sheet->setCellValue('I4', 'TAUX H');
     $sheet->setCellValue('J4', 'PRIME DE PANIER');
-
     // K: Salaire net (fusion K3:K4)
     $sheet->setCellValue('K3', 'SALAIRE NET');
     $sheet->mergeCells('K3:K4');
-
         // Style en-têtes
     $sheet->getStyle('A3:K4')->applyFromArray([
             'font' => ['bold' => true, 'size' => 10],
@@ -477,36 +471,44 @@ class SalaryExportController extends Controller
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
         ]);
     $sheet->setAutoFilter('A4:K4');
-
         $row = 5;
-
         // Pour récupérer les valeurs détaillées des heures, on va calculer les nouvelles métriques
         foreach ($employes as $emp) {
             $detailedStats = \App\Services\TimeCalculationService::computeDetailedTemporaryStats($emp, $dateRange);
-
             // Taux horaire = salaire_base (si présent) sinon 0
             $tauxH = $emp->salaire_base ?? 0;
             // Prime de panier récupérée depuis la table salaires (colonne panie ou panier)
             $primePanier = $emp->panier ?? 0;
-
             // Coût total = (HeuresNormales * TauxH) + (HS25 * TauxH * 1.25) + (HS50 * TauxH * 1.5) + (PrimePanier * TotalJours)
             $coutTotal = ($detailedStats['heures_normales'] * $tauxH)
                 + ($detailedStats['hs_25'] * $tauxH * 1.25)
                 + ($detailedStats['hs_50'] * $tauxH * 1.5)
                 + ($primePanier * $detailedStats['jours_travailles']);
-
             // Set row cells individually so we can put a formula for Salaire Net (col J)
+            // === Formules de récupération depuis la feuille "Employés Temporaires" ===
+            $hnFormula   = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!AJ:AJ, 0), 0)", $row);
+$hs25Formula = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!AK:AK, 0), 0)", $row);
+$hs50Formula = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!AL:AL, 0), 0)", $row);
+
+
+            
             $sheet->setCellValue('A' . $row, strtoupper(trim(($emp->name ?? '') . ' ' . ($emp->prenom ?? ''))));
             $sheet->setCellValue('B' . $row, strtoupper($emp->fonction ?? ''));
-            $sheet->setCellValue('C' . $row, strtoupper($emp->departement_nom ?? ''));
-            $sheet->setCellValue('D' . $row, $detailedStats['heures_normales']);
-            $sheet->setCellValue('E' . $row, $detailedStats['hs_25']);
-            $sheet->setCellValue('F' . $row, $detailedStats['hs_50']);
-            $sheet->setCellValue('G' . $row, $detailedStats['total_heures']);
+            $tmpDeptLabel = strtoupper(trim((string)($emp->departement_nom ?? '')));
+            if ($tmpDeptLabel === '' || $tmpDeptLabel === 'NON DEFINI' || $tmpDeptLabel === 'NON DÉFINI' || $tmpDeptLabel === 'NON-DEFINI') {
+                $tmpDeptLabel = 'NON AFFECTÉ';
+            }
+
+
+            $sheet->setCellValue('C' . $row, $tmpDeptLabel);
+            $sheet->setCellValue('D' . $row, $hnFormula);
+$sheet->setCellValue('E' . $row, $hs25Formula);
+$sheet->setCellValue('F' . $row, $hs50Formula);
+            $sheet->setCellValue('G' . $row, sprintf("=D%d+E%d+F%d", $row, $row, $row));
+
             $sheet->setCellValue('H' . $row, $detailedStats['jours_travailles']);
             $sheet->setCellValue('I' . $row, $tauxH);
             $sheet->setCellValue('J' . $row, $primePanier);
-
             // Salaire net formula: =D{row}*I{row} + E{row}*I{row}*1.25 + F{row}*I{row}*1.5 + H{row}*J{row}
             $formula = sprintf('=D%1$d*I%1$d + E%1$d*I%1$d*1.25 + F%1$d*I%1$d*1.5 + H%1$d*J%1$d', $row);
             $sheet->setCellValue('K' . $row, $formula);
@@ -518,7 +520,6 @@ class SalaryExportController extends Controller
             ]);
             $row++;
         }
-
         // Appliquer format d'affichage (display-only) pour la feuille temporaires
         $firstDataRow = 5;
         $lastDataRow  = $row - 1;
@@ -530,27 +531,20 @@ class SalaryExportController extends Controller
             // Taux H, Panier et Salaire net (I..K) entier pour affichage
             $this->formatRange($sheet, 'I' . $firstDataRow . ':K' . $lastDataRow, 0);
         }
-
         foreach (range('A','J') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
         $sheet->freezePane('A5');
     }
-
-    
-
     // computeDailyRawHours and checkNightOverlap are provided by TimeCalculationService
-
     private function computeTemporarySalaryStats($user, $dateRange)
     {
         if (isset($this->temporaryStats[$user->id])) {
             return $this->temporaryStats[$user->id];
         }
-
         // Utiliser MonthlyPresenceExportController pour obtenir les données calculées
         $monthlyController = new \App\Http\Controllers\MonthlyPresenceExportController();
         $monthlyStats = $this->getDataFromMonthlyExport($user, $dateRange, false); // false = temporaire
-        
         if ($monthlyStats) {
             $result = [
                 'total_heures' => $monthlyStats['total_heures'],
@@ -561,36 +555,32 @@ class SalaryExportController extends Controller
             // Fallback: calcul direct si pas trouvé
             $result = $this->computeTemporarySalaryStatsDirect($user, $dateRange);
         }
-        
         $this->temporaryStats[$user->id] = $result;
         return $result;
     }
-
     private function getDataFromMonthlyExport($user, $dateRange, $isPermanent)
     {
-        // Simuler la logique de MonthlyPresenceExportController pour récupérer les données
-        $joursFeries = JourFerie::whereBetween('date', [
-            $dateRange['startDate']->format('Y-m-d'),
-            $dateRange['endDate']->format('Y-m-d')
-        ])->where('actif', true)->pluck('date')->map(fn($d)=>date('Y-m-d',strtotime($d)))->toArray();
-
+        // Utiliser les services pour récupérer les données (jours fériés et pointages)
+        $joursFeries = TimeCalculationService::getHolidays($dateRange);
+        $groupedPointages = TimeCalculationService::getUserPointagesGrouped((int)$user->id, $dateRange);
+        // Indexer par date
+        $pointagesByDate = [];
+        foreach ($groupedPointages as $pt) {
+            $date = $pt->date;
+            if (!isset($pointagesByDate[$date])) $pointagesByDate[$date] = [];
+            $pointagesByDate[$date][] = $pt;
+        }
         if ($isPermanent) {
             // Logique permanents du MonthlyPresenceExportController
             $totalHeures = 0.0;
             $heuresSupp = 0.0;
             $joursTravailles = 0;
-
             $currentDate = clone $dateRange['startDate'];
             while ($currentDate <= $dateRange['endDate']) {
                 $dateStr = $currentDate->format('Y-m-d');
                 $dayOfWeek = $currentDate->format('w');
                 $isHoliday = in_array($dateStr, $joursFeries);
-
-                $pointages = DB::table('pointages')
-                    ->where('user_id', $user->id)
-                    ->whereDate('date', $dateStr)
-                    ->get();
-
+                $pointages = $pointagesByDate[$dateStr] ?? [];
                 $conge = DB::table('absence_requests')
                     ->where('user_id', $user->id)
                     ->whereIn('type', ['Congé', 'maladie'])
@@ -598,16 +588,14 @@ class SalaryExportController extends Controller
                     ->whereDate('dateDebut', '<=', $dateStr)
                     ->whereDate('dateFin', '>=', $dateStr)
                     ->first();
-
                 $hasPresent = false;
                 foreach ($pointages as $pt) {
-                    if (in_array($pt->statutJour, ['present','retard'])) $hasPresent = true;
+                    $st = (string)($pt->statutJour ?? '');
+                    if (preg_match('/pr[eé]sent|retard/i', $st)) { $hasPresent = true; }
                 }
-
-                // temporaires: appliquer règle par shift
-                $totalDailyHours = TimeCalculationService::computeDailyTotalHoursForTemporary($pointages);
-                $nightBaseHours = $this->calculateNightBaseHours($pointages);
-
+                // permanents: utiliser la règle dédiée (+pause si pas de nuit)
+                $totalDailyHours = TimeCalculationService::computeDailyTotalHoursForPermanent($pointages);
+                $nightBaseHours  = TimeCalculationService::calculateNightBaseHours($pointages);
                 if ($conge) {
                     // Jour de congé
                 } elseif ($isHoliday) {
@@ -627,10 +615,8 @@ class SalaryExportController extends Controller
                     }
                     $totalHeures += $totalDailyHours;
                 }
-
                 $currentDate->modify('+1 day');
             }
-
             return [
                 'total_heures' => $totalHeures,
                 'heures_supp' => $heuresSupp,
@@ -641,18 +627,12 @@ class SalaryExportController extends Controller
             $totalHeures = 0.0;
             $heuresSupp = 0.0;
             $joursTravailles = 0;
-
             $currentDate = clone $dateRange['startDate'];
             while ($currentDate <= $dateRange['endDate']) {
                 $dateStr = $currentDate->format('Y-m-d');
                 $dayOfWeek = $currentDate->format('w');
                 $isHoliday = in_array($dateStr, $joursFeries);
-
-                $pointages = DB::table('pointages')
-                    ->where('user_id', $user->id)
-                    ->whereDate('date', $dateStr)
-                    ->get();
-
+                $pointages = $pointagesByDate[$dateStr] ?? [];
                 $conge = DB::table('absence_requests')
                     ->where('user_id', $user->id)
                     ->whereIn('type', ['Congé', 'maladie'])
@@ -660,7 +640,6 @@ class SalaryExportController extends Controller
                     ->whereDate('dateDebut', '<=', $dateStr)
                     ->whereDate('dateFin', '>=', $dateStr)
                     ->first();
-
                 if ($conge) {
                     // Jour de congé
                 } else {
@@ -677,7 +656,6 @@ class SalaryExportController extends Controller
                 }
                 $currentDate->modify('+1 day');
             }
-
             return [
                 'total_heures' => $totalHeures,
                 'heures_supp' => $heuresSupp,
@@ -685,25 +663,26 @@ class SalaryExportController extends Controller
             ];
         }
     }
-
     private function computeTemporarySalaryStatsDirect($user, $dateRange)
     {
         // Ancien calcul direct en fallback
         $totalHeures = 0.0;
         $heuresSupp = 0.0;
         $joursTravailles = 0;
-
-        $joursFeries = JourFerie::whereBetween('date', [
-            $dateRange['startDate']->format('Y-m-d'),
-            $dateRange['endDate']->format('Y-m-d')
-        ])->where('actif', true)->pluck('date')->map(fn($d)=>date('Y-m-d',strtotime($d)))->toArray();
-
+        // Utiliser les services partagés
+        $joursFeries = TimeCalculationService::getHolidays($dateRange);
+        $groupedPointages = TimeCalculationService::getUserPointagesGrouped((int)$user->id, $dateRange);
+        $pointagesByDate = [];
+        foreach ($groupedPointages as $pt) {
+            $date = $pt->date;
+            if (!isset($pointagesByDate[$date])) $pointagesByDate[$date] = [];
+            $pointagesByDate[$date][] = $pt;
+        }
         $currentDate = clone $dateRange['startDate'];
         while ($currentDate <= $dateRange['endDate']) {
             $dateStr = $currentDate->format('Y-m-d');
             $dayOfWeek = (int)$currentDate->format('w');
             $isHoliday = in_array($dateStr, $joursFeries, true);
-
             $conge = DB::table('absence_requests')
                 ->where('user_id', $user->id)
                 ->whereIn('type', ['Congé', 'maladie'])
@@ -711,17 +690,11 @@ class SalaryExportController extends Controller
                 ->whereDate('dateDebut', '<=', $dateStr)
                 ->whereDate('dateFin', '>=', $dateStr)
                 ->first();
-
             if ($conge) {
                 $currentDate->modify('+1 day');
                 continue;
             }
-
-            $pointages = DB::table('pointages')
-                ->where('user_id', $user->id)
-                ->whereDate('date', $dateStr)
-                ->get();
-
+            $pointages = $pointagesByDate[$dateStr] ?? [];
             $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pointages);
             if ($daily > 0) {
                 $joursTravailles++;
@@ -734,119 +707,14 @@ class SalaryExportController extends Controller
             }
             $currentDate->modify('+1 day');
         }
-
         return [
             'total_heures' => $totalHeures,
             'heures_supp' => $heuresSupp,
             'jours_travailles' => $joursTravailles
         ];
     }
-
     // ==== LOGIQUE ALIGNÉE AVEC MonthlyPresenceExportController (calcul heures) ====
-    private function parseTime($timeString)
-    {
-        if (empty($timeString)) return false;
-        $timeString = trim($timeString);
-
-        if (preg_match('/^(\d{1,2}):(\d{2}):(\d{2})$/', $timeString, $m)) {
-            $h=intval($m[1]); $i=intval($m[2]); $s=intval($m[3]);
-            if ($h>=0&&$h<=23 && $i>=0&&$i<=59 && $s>=0&&$s<=59) return mktime($h,$i,$s);
-        }
-        if (preg_match('/^(\d{1,2}):(\d{2})$/', $timeString, $m)) {
-            $h=intval($m[1]); $i=intval($m[2]);
-            if ($h>=0&&$h<=23 && $i>=0&&$i<=59) return mktime($h,$i,0);
-        }
-        if (preg_match('/^(\d):(\d{2})$/', $timeString, $m)) {
-            $h=intval($m[1]); $i=intval($m[2]);
-            if ($h>=0&&$h<=9 && $i>=0&&$i<=59) return mktime($h,$i,0);
-        }
-
-        $ts = strtotime($timeString);
-        if ($ts !== false) {
-            $h = date('H', $ts);
-            $i = date('i', $ts);
-            $s = date('s', $ts);
-            return mktime($h,$i,$s);
-        }
-        Log::warning("Format d'heure non reconnu", ['heure_originale' => $timeString]);
-        return false;
-    }
-
-    private function calculateDailyHours($pointage)
-    {
-        if (empty($pointage->heureEntree) || empty($pointage->heureSortie)) return 0.0;
-
-        $start = $this->parseTime($pointage->heureEntree);
-        $end   = $this->parseTime($pointage->heureSortie);
-
-        if ($start === false || $end === false) return 0.0;
-
-        if ($end < $start) $end += 86400;
-
-        $seconds = $end - $start;
-        if ($seconds <= 0) return 0.0;
-        if ($seconds > 86400) {
-            Log::warning('Durée de travail > 24h détectée', [
-                'in' => $pointage->heureEntree, 'out' => $pointage->heureSortie, 'seconds' => $seconds
-            ]);
-            return 0.0;
-        }
-
-        $hours = $seconds / 3600.0;
-        return max(0.0, $hours);
-    }
-
-    private function calculateNightBaseHours($pointages)
-    {
-        $total = 0.0;
-        foreach ($pointages as $p) {
-            $start = $this->parseTime($p->heureEntree);
-            $end   = $this->parseTime($p->heureSortie);
-            if ($start === false || $end === false) continue;
-            if ($end < $start) $end += 86400;
-
-            $s = $start / 3600.0;
-            $e = $end   / 3600.0;
-
-            $ov1 = max(0.0, min($e, 8.0)  - max($s, 0.0));
-            $ov2 = max(0.0, min($e, 32.0) - max($s, 24.0));
-
-            $total += ($ov1 + $ov2);
-        }
-        return $total;
-    }
-
-    private function computeDailyTotalHours($pointages)
-    {
-        if (!$pointages || count($pointages) === 0) return 0.0;
-
-        $totalRaw = 0.0;
-        $overlapsNight = false;
-
-        foreach ($pointages as $p) {
-            $totalRaw += $this->calculateDailyHours($p);
-
-            $start = $this->parseTime($p->heureEntree);
-            $end   = $this->parseTime($p->heureSortie);
-            if ($start === false || $end === false) continue;
-            if ($end < $start) $end += 86400;
-
-            $s = $start / 3600.0;
-            $e = $end   / 3600.0;
-            $ovNight1 = max(0.0, min($e, 9.0)  - max($s, 0.0));
-            $ovNight2 = max(0.0, min($e, 33.0) - max($s, 24.0));
-            if (($ovNight1 + $ovNight2) > 0) $overlapsNight = true;
-        }
-
-        if (!$overlapsNight && $totalRaw > 8.0) {
-            $totalRaw -= 1.0;
-        }
-
-        return max(0.0, $totalRaw);
-    }
-
-    // computeDailyTotalHoursForTemporary is provided by TimeCalculationService
-
+    // computeDaily* and night-base helpers are provided by TimeCalculationService
     private function getMoisFrancais($moisNum)
     {
         $mois = [
@@ -856,7 +724,6 @@ class SalaryExportController extends Controller
         ];
         return $mois[$moisNum] ?? 'Mois';
     }
-
     private function calculateEmployeeStats($userId, $dateRange)
     {
         // Récupérer les données depuis MonthlyPresenceExportController pour plus de cohérence
@@ -864,9 +731,7 @@ class SalaryExportController extends Controller
         if (!$user) {
             return ['jours_travailles' => 0, 'conges' => 0, 'total_heures' => 0, 'heures_supp' => 0];
         }
-
         $monthlyStats = $this->getDataFromMonthlyExport($user, $dateRange, true); // true = permanent
-        
         if ($monthlyStats) {
             return [
                 'jours_travailles' => $monthlyStats['jours_travailles'],
@@ -875,18 +740,15 @@ class SalaryExportController extends Controller
                 'heures_supp' => $monthlyStats['heures_supp']
             ];
         }
-
         // Fallback: calcul direct
         return $this->calculateEmployeeStatsDirect($userId, $dateRange);
     }
-
     private function calculateConges($userId, $dateRange)
     {
         $conges = 0;
         $currentDate = clone $dateRange['startDate'];
         while ($currentDate <= $dateRange['endDate']) {
             $dateStr = $currentDate->format('Y-m-d');
-            
             $conge = DB::table('absence_requests')
                 ->where('user_id', $userId)
                 ->whereIn('type', ['Congé', 'maladie'])
@@ -894,33 +756,30 @@ class SalaryExportController extends Controller
                 ->whereDate('dateDebut', '<=', $dateStr)
                 ->whereDate('dateFin', '>=', $dateStr)
                 ->first();
-            
             if ($conge) {
                 $conges++;
             }
-            
             $currentDate->modify('+1 day');
         }
-        
         return $conges;
     }
-
     private function calculateEmployeeStatsDirect($userId, $dateRange)
     {
         $joursTravailles = 0;
         $conges = 0;
-        
+        // Précharger les pointages groupés par date via service
+        $pts = TimeCalculationService::getUserPointagesGrouped((int)$userId, $dateRange);
+        $byDate = [];
+        foreach ($pts as $p) { $byDate[$p->date][] = $p; }
         $currentDate = clone $dateRange['startDate'];
         while ($currentDate <= $dateRange['endDate']) {
             $dateStr = $currentDate->format('Y-m-d');
-            
             // Vérifier les pointages
-            $pointage = DB::table('pointages')
-                ->where('user_id', $userId)
-                ->whereDate('date', $dateStr)
-                ->where('statutJour', 'present')
-                ->first();
-            
+            $hasPresent = false;
+            foreach ($byDate[$dateStr] ?? [] as $p) {
+                $st = strtolower(trim((string)($p->statutJour ?? '')));
+                if (preg_match('/pr[eé]sent|retard/i', $st)) { $hasPresent = true; break; }
+            }
             // Vérifier les congés
             $conge = DB::table('absence_requests')
                 ->where('user_id', $userId)
@@ -929,16 +788,13 @@ class SalaryExportController extends Controller
                 ->whereDate('dateDebut', '<=', $dateStr)
                 ->whereDate('dateFin', '>=', $dateStr)
                 ->first();
-            
             if ($conge) {
                 $conges++;
-            } elseif ($pointage) {
+            } elseif ($hasPresent) {
                 $joursTravailles++;
             }
-            
             $currentDate->modify('+1 day');
         }
-        
         return [
             'jours_travailles' => $joursTravailles,
             'conges' => $conges,
@@ -946,7 +802,6 @@ class SalaryExportController extends Controller
             'heures_supp' => 0
         ];
     }
-
     private function exportExcel($spreadsheet, $dateRange, $prefix = 'Export')
     {
         $filename = $prefix . "_" . $dateRange['label'] . ".xlsx";
@@ -965,12 +820,10 @@ class SalaryExportController extends Controller
             'Pragma' => 'public',
         ]);
     }
-
     private function createRecapChargePersonnelSheet($spreadsheet, $societeId, $dateRange)
     {
         $sheet = $spreadsheet->createSheet();
         $sheet->setTitle('Recap');
-
         // Titre principal
         $row = 1;
         $sheet->setCellValue('A' . $row, 'CHARGE PERSONNEL DCT');
@@ -982,23 +835,19 @@ class SalaryExportController extends Controller
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THICK]]
         ]);
         $row += 2;
-
         // Générer les en-têtes de mois (12 mois de l'année courante)
         $currentYear = date('Y');
         $monthHeaders = [];
         for ($m = 1; $m <= 12; $m++) {
             $monthHeaders[] = date('M-y', mktime(0, 0, 0, $m, 1, $currentYear));
         }
-
         // En-têtes du tableau
         $headers = [''];  // Première colonne vide pour les libellés
         $headers = array_merge($headers, $monthHeaders);
-
         foreach ($headers as $index => $header) {
             $colLetter = Coordinate::stringFromColumnIndex($index + 1);
             $sheet->setCellValue($colLetter . $row, $header);
         }
-
         $lastCol = Coordinate::stringFromColumnIndex(count($headers));
         $sheet->getStyle('A' . $row . ':' . $lastCol . $row)->applyFromArray([
             'font' => ['bold' => true, 'size' => 12, 'color' => ['rgb' => 'FFFFFF']],
@@ -1007,7 +856,6 @@ class SalaryExportController extends Controller
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
         ]);
         $row++;
-
         // Lignes de données selon l'image
         $dataRows = [
             'PERMANENT',
@@ -1017,19 +865,16 @@ class SalaryExportController extends Controller
             'AUTRES CHARGES RH',
             'TOTAL CHARGE PERSONNEL'
         ];
-
         // Calculer les montants pour chaque ligne selon chaque mois
         $startRowData = $row;
         foreach ($dataRows as $index => $rowLabel) {
             $sheet->setCellValue('A' . $row, $rowLabel);
-            
             if ($rowLabel === 'PERMANENT') {
                 // Calculer pour chaque mois
                 for ($col = 2; $col <= count($headers); $col++) {
                     $colLetter = Coordinate::stringFromColumnIndex($col);
                     $monthIndex = $col - 2; // Index du mois (0-11)
                     $monthNumber = $monthIndex + 1; // Numéro du mois (1-12)
-                    
                     $totalSalaireNet = $this->calculatePermanentSalaryTotalForMonth($societeId, $currentYear, $monthNumber);
                     // Utiliser la valeur numérique brute (sans arrondi) pour permettre les calculs Excel
                     $sheet->setCellValue($colLetter . $row, $totalSalaireNet);
@@ -1047,7 +892,6 @@ class SalaryExportController extends Controller
                     $colLetter = Coordinate::stringFromColumnIndex($col);
                     $monthIndex = $col - 2; // Index du mois (0-11)
                     $monthNumber = $monthIndex + 1; // Numéro du mois (1-12)
-                    
                     $totalCoutTemporaires = $this->calculateTemporaryCostTotalForMonth($societeId, $currentYear, $monthNumber);
                     // Utiliser la valeur numérique brute (sans arrondi) pour permettre les calculs Excel
                     $sheet->setCellValue($colLetter . $row, $totalCoutTemporaires);
@@ -1074,13 +918,11 @@ class SalaryExportController extends Controller
                     $temporaireRow = $startRowData + 2;
                     $chargesTemporaireRow = $startRowData + 3;
                     $autresChargesRow = $startRowData + 4;
-                    
                     $sheet->setCellValue($colLetter . $row, 
                         "={$colLetter}{$permanentRow}+{$colLetter}{$chargesPermanentRow}+{$colLetter}{$temporaireRow}+{$colLetter}{$chargesTemporaireRow}+{$colLetter}{$autresChargesRow}"
                     );
                 }
             }
-
             // Style spécial pour la ligne total
             if ($rowLabel === 'TOTAL CHARGE PERSONNEL') {
                 $sheet->getStyle('A' . $row . ':' . $lastCol . $row)->applyFromArray([
@@ -1095,27 +937,246 @@ class SalaryExportController extends Controller
             }
             $row++;
         }
-
         // Appliquer format d'affichage (display-only) pour toutes les cellules numériques du bloc données
         $endRowData = $row - 1;
         if ($endRowData >= $startRowData) {
             $this->formatRange($sheet, 'B' . $startRowData . ':' . $lastCol . $endRowData, 0);
         }
-
         // Auto-ajuster les colonnes
         for ($c = 1; $c <= count($headers); $c++) {
             $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
         }
-
         $sheet->freezePane('B4');
     }
+    /**
+ * Construit une expression Excel de plage figée via INDIRECT
+ * ex: INDIRECT("'Employés Permanents'!C5:C29")
+ */
+private function xlIndirectRange(string $sheetName, int $colIndex, int $rowStart, int $rowEnd): string
+{
+    $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($colIndex);
+    // échapper d'éventuels apostrophes dans le nom de feuille
+    $sheetEsc = str_replace("'", "''", $sheetName);
+    return "INDIRECT(\"'{$sheetEsc}'!{$col}{$rowStart}:{$col}{$rowEnd}\")";
+}
+
+/**
+ * Feuille "Récap" — agrège effectif moyen / total effectif / HN / HS par département,
+ * en gelant les plages des feuilles source via INDIRECT pour éviter tout glissement.
+ */
+private function createRecapSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $spreadsheet, $societeId, array $dateRange)
+{
+    // -------- Indices colonnes dynamiques selon la période --------
+    // Permanents
+    $permPresenceStart = $this->presenceStartCol(true);
+    $permPresenceEnd   = $permPresenceStart + $dateRange['totalDays'] - 1;
+    $permTotalsStart   = $permPresenceEnd + 1;
+    $permColJoursTrav  = $permTotalsStart + 3; // Total Jours Travaillés
+    $permColHS         = $permTotalsStart + 4; // Heures Supp.
+    $permColHN         = $permTotalsStart + 5; // Heures Normales
+    $permDeptCol       = 3; // C
+
+    // Temporaires
+    $tempPresenceStart = $this->presenceStartCol(false);
+    $tempPresenceEnd   = $tempPresenceStart + $dateRange['totalDays'] - 1;
+    $tempTotalsStart   = $tempPresenceEnd + 1;
+    $tempColHN         = $tempTotalsStart + 0; // Heures Normales
+    $tempColHS25       = $tempTotalsStart + 1; // HS25
+    $tempColHS50       = $tempTotalsStart + 2; // HS50
+    $tempDeptCol       = 4; // D
+
+    // Feuilles & bornes fixes (lignes de données commencent à 5)
+    $dataStartRow = 5;
+
+    $permSheet = $spreadsheet->getSheetByName('Employés Permanents');
+    $tempSheet = $spreadsheet->getSheetByName('Employés Temporaires');
+
+    // Dernières lignes réelles sur chaque feuille (on force un min à 5)
+    $permLastRow = $permSheet ? max($dataStartRow, (int)$permSheet->getHighestDataRow()) : $dataStartRow;
+    $tempLastRow = $tempSheet ? max($dataStartRow, (int)$tempSheet->getHighestDataRow()) : $dataStartRow;
+
+    $permName = $permSheet ? $permSheet->getTitle() : null;
+    $tempName = $tempSheet ? $tempSheet->getTitle() : null;
+
+    // Liste des départements (basée sur les pointages)
+    $departements = \DB::table('pointages')
+        ->join('users', 'users.id', '=', 'pointages.user_id')
+        ->leftJoin('departements', 'departements.id', '=', 'pointages.departement_id')
+        ->where('users.societe_id', $societeId)
+        ->whereBetween('pointages.date', [
+            $dateRange['startDate']->format('Y-m-d'),
+            $dateRange['endDate']->format('Y-m-d')
+        ])
+        ->select(\DB::raw("UPPER(TRIM(COALESCE(NULLIF(TRIM(departements.nom), ''), 'NON AFFECTÉ'))) as dept"))
+        ->distinct()
+        ->orderBy('dept')
+        ->pluck('dept')
+        ->toArray();
+
+    // Feuille récap
+    $recap = $spreadsheet->createSheet();
+    $recap->setTitle('Récap');
+
+    $r = 1;
+    $recap->setCellValue('A'.$r, 'RÉCAPITULATIF (agrégation feuilles — 7 métriques)');
+    $recap->mergeCells('A'.$r.':H'.$r);
+    $recap->getStyle('A'.$r.':H'.$r)->applyFromArray([
+        'font'=>['bold'=>true,'size'=>15],
+        'alignment'=>['horizontal'=>\PhpOffice\PhpSpreadsheet\Style\Alignment::HORIZONTAL_CENTER],
+        'fill'=>['fillType'=>\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,'startColor'=>['rgb'=>'D9EAD3']],
+        'borders'=>['allBorders'=>['borderStyle'=>\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THICK]],
+    ]);
+    $r += 2;
+
+    // Helper jours effectifs
+    $startY = (int)$dateRange['startDate']->format('Y');
+    $startM = (int)$dateRange['startDate']->format('n');
+    $startD = (int)$dateRange['startDate']->format('j');
+    $endY   = (int)$dateRange['endDate']->format('Y');
+    $endM   = (int)$dateRange['endDate']->format('n');
+    $endD   = (int)$dateRange['endDate']->format('j');
+    $daysFormula = "=MAX(1, MIN(DATE($endY,$endM,$endD), TODAY()) - DATE($startY,$startM,$startD) + 1)";
+    $recap->setCellValue('I1', $daysFormula);
+    $recap->getStyle('I1')->getNumberFormat()->setFormatCode('#,##0');
+
+    // En-têtes
+    $headers = [
+        'DÉPARTEMENT',
+        'MOYENNE EFFECTIF PAR JOUR', // = TOTAL EFFECTIF / jours effectifs
+        'TOTAL EFFECTIF',
+        'TOTAL HEURES NORMALES',
+        'TOTAL HEURES SUPP',
+        'SALAIRE',     // Somme des salaires par département (P + T)
+        'COÛT',        // = SALAIRE + CHARGE
+        'CHARGE'       // = SALAIRE * 27%
+    ];
+    foreach ($headers as $i=>$h) {
+        $recap->setCellValue($this->col($i+1).$r, $h);
+    }
+    $recap->getStyle('A'.$r.':'.$this->col(count($headers)).$r)->applyFromArray([
+        'font'=>['bold'=>true,'color'=>['rgb'=>'FFFFFF']],
+        'alignment'=>['horizontal'=>\PhpOffice\PhpSpreadsheet\Style\Alignment::HORIZONTAL_CENTER],
+        'fill'=>['fillType'=>\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,'startColor'=>['rgb'=>'4472C4']],
+        'borders'=>['allBorders'=>['borderStyle'=>\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN]],
+    ]);
+    $r++;
+
+    // Construit les plages (même méthode, mêmes colonnes, même ligne de départ = 5)
+    $permDeptRange = $this->col($permDeptCol).$dataStartRow.':'.$this->col($permDeptCol).$permLastRow;     // ex: C5:C29
+    $permJTRange   = $this->col($permColJoursTrav).$dataStartRow.':'.$this->col($permColJoursTrav).$permLastRow; // ex: AL5:AL29
+    $permHNRange   = $this->col($permColHN).$dataStartRow.':'.$this->col($permColHN).$permLastRow;
+    $permHSRange   = $this->col($permColHS).$dataStartRow.':'.$this->col($permColHS).$permLastRow;
+
+    $tempDeptRange = $this->col($tempDeptCol).$dataStartRow.':'.$this->col($tempDeptCol).$tempLastRow;     // ex: D5:D38
+    $tempHNRange   = $this->col($tempColHN).$dataStartRow.':'.$this->col($tempColHN).$tempLastRow;         // ex: AJ5:AJ38
+    $tempHS25Range = $this->col($tempColHS25).$dataStartRow.':'.$this->col($tempColHS25).$tempLastRow;     // ex: AK5:AK38
+    $tempHS50Range = $this->col($tempColHS50).$dataStartRow.':'.$this->col($tempColHS50).$tempLastRow;     // ex: AL5:AL38
+
+    // Feuilles salaires pour agrégations financières
+    $dataStartRowSal = 5;
+    $permSalSheet = $spreadsheet->getSheetByName('Salaire Permanent');
+    $tempSalSheet = $spreadsheet->getSheetByName('Salaire Temporaire');
+    $permSalLastRow = $permSalSheet ? max($dataStartRowSal, (int)$permSalSheet->getHighestDataRow()) : $dataStartRowSal;
+    $tempSalLastRow = $tempSalSheet ? max($dataStartRowSal, (int)$tempSalSheet->getHighestDataRow()) : $dataStartRowSal;
+    $permSalName = $permSalSheet ? $permSalSheet->getTitle() : null;
+    $tempSalName = $tempSalSheet ? $tempSalSheet->getTitle() : null;
+    // Plages: Département et Salaire dans feuilles salaires (D/G pour permanents, C/K pour temporaires)
+    $permSalDeptRange = "D{$dataStartRowSal}:D{$permSalLastRow}";
+    $permSalValRange  = "G{$dataStartRowSal}:G{$permSalLastRow}"; // SALAIRE NET 26J
+    $tempSalDeptRange = "C{$dataStartRowSal}:C{$tempSalLastRow}";
+    $tempSalValRange  = "K{$dataStartRowSal}:K{$tempSalLastRow}"; // SALAIRE NET calculé
+
+    // Lignes par département
+    foreach ($departements as $dept) {
+        // Libellé
+        $recap->setCellValue('A'.$r, $dept);
+
+        // Critère
+        $critDept = ($dept === 'NON AFFECTÉ') ? '"NON AFFECTÉ"' : ('A'.$r);
+
+        // TOTAL EFFECTIF (même structure que ton exemple correct)
+        $parts = [];
+        if ($permName) {
+            $parts[] = "SUMPRODUCT(--('".$permName."'!".$permDeptRange."=".$critDept."),--('".$permName."'!".$permJTRange.">0))";
+        }
+        if ($tempName) {
+            $parts[] = "SUMPRODUCT(--('".$tempName."'!".$tempDeptRange."=".$critDept."),--(('".$tempName."'!".$tempHNRange."+"
+                     . "'".$tempName."'!".$tempHS25Range."+"
+                     . "'".$tempName."'!".$tempHS50Range.")>0))";
+        }
+        $recap->setCellValue('C'.$r, '='.(count($parts) ? implode('+', $parts) : '0'));
+
+        // MOYENNE EFFECTIF PAR JOUR
+        $recap->setCellValue('B'.$r, '=IF($I$1>0, C'.$r.'/$I$1, 0)');
+
+        // TOTAL HEURES NORMALES
+        $sumHN = [];
+        if ($permName) $sumHN[] = "SUMIF('".$permName."'!".$permDeptRange.",".$critDept.",'".$permName."'!".$permHNRange.")";
+        if ($tempName) $sumHN[] = "SUMIF('".$tempName."'!".$tempDeptRange.",".$critDept.",'".$tempName."'!".$tempHNRange.")";
+        $recap->setCellValue('D'.$r, "=".(count($sumHN)?implode('+',$sumHN):'0'));
+
+        // TOTAL HEURES SUPP
+        $sumHS = [];
+        if ($permName) $sumHS[] = "SUMIF('".$permName."'!".$permDeptRange.",".$critDept.",'".$permName."'!".$permHSRange.")";
+        if ($tempName) {
+            $sumHS[] = "SUMIF('".$tempName."'!".$tempDeptRange.",".$critDept.",'".$tempName."'!".$tempHS25Range.")";
+            $sumHS[] = "SUMIF('".$tempName."'!".$tempDeptRange.",".$critDept.",'".$tempName."'!".$tempHS50Range.")";
+        }
+        $recap->setCellValue('E'.$r, "=".(count($sumHS)?implode('+',$sumHS):'0'));
+
+        // SALAIRE par département = PERM(G) + TEMP(K)
+        $sumSalaire = [];
+        if ($permSalName) $sumSalaire[] = "SUMIF('{$permSalName}'!{$permSalDeptRange},{$critDept},'{$permSalName}'!{$permSalValRange})";
+        if ($tempSalName) $sumSalaire[] = "SUMIF('{$tempSalName}'!{$tempSalDeptRange},{$critDept},'{$tempSalName}'!{$tempSalValRange})";
+        $recap->setCellValue('F'.$r, '='.(count($sumSalaire)?implode('+',$sumSalaire):'0'));
+
+        // CHARGE = 27% du SALAIRE (col F)
+        $recap->setCellValue('H'.$r, '=F'.$r.'*0.27');
+        // COÛT = SALAIRE + CHARGE (F + H)
+        $recap->setCellValue('G'.$r, '=F'.$r.'+H'.$r);
+
+        // Style ligne
+        $recap->getStyle('A'.$r.':H'.$r)->applyFromArray([
+            'borders'=>['allBorders'=>['borderStyle'=>\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN]],
+            'alignment'=>['vertical'=>\PhpOffice\PhpSpreadsheet\Style\Alignment::VERTICAL_CENTER],
+        ]);
+
+        $r++;
+    }
+
+    // TOTAL général
+    $recap->setCellValue('A'.$r, 'TOTAL');
+    $startRowDepts = $r - count($departements);
+
+    // B total = somme des effectifs moyens par département
+    $recap->setCellValue('B'.$r, "=SUM(B{$startRowDepts}:B".($r-1).")");
+    // C..H = sommes par colonne
+    foreach (['C','D','E','F','G','H'] as $L) {
+        $recap->setCellValue($L.$r, "=SUM(".$L.($r - count($departements)).":".$L.($r-1).")");
+    }
+    $recap->getStyle('A'.$r.':H'.$r)->applyFromArray([
+        'font'=>['bold'=>true],
+        'fill'=>['fillType'=>\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID,'startColor'=>['rgb'=>'E2EFDA']],
+        'borders'=>['allBorders'=>['borderStyle'=>\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THICK]],
+    ]);
+
+    // Formats : B en décimal (2), C..H en entier
+    $recap->getStyle('B3:B'.$r)->getNumberFormat()->setFormatCode('#,##0.00');
+    $this->formatRange($recap, 'C3:H'.$r, 0);
+
+    // Auto-size
+    foreach (range('A','H') as $c) {
+        $recap->getColumnDimension($c)->setAutoSize(true);
+    }
+}
+
+
 
     private function calculatePermanentSalaryTotalForMonth($societeId, $year, $month)
     {
         // Créer les dates de début et fin du mois
         $startOfMonth = new DateTime("$year-$month-01");
         $endOfMonth = (clone $startOfMonth)->modify('last day of this month');
-        
         // Récupérer la somme des salaires nets des employés permanents actifs dans ce mois
         $total = DB::table('users')
             ->leftJoin('salaires', 'users.id', '=', 'salaires.user_id')
@@ -1140,21 +1201,17 @@ class SalaryExportController extends Controller
                       ->orWhere('users.typeContrat', 'LIKE', '%CDI%');
             })
             ->sum('salaires.salaire_net');
-            
         return $total ?? 0;
     }
-
     private function calculateTemporaryCostTotalForMonth($societeId, $year, $month)
     {
         // Créer la période du mois
         $startOfMonth = new DateTime("$year-$month-01");
         $endOfMonth = (clone $startOfMonth)->modify('last day of this month');
-        
         $monthDateRange = [
             'startDate' => $startOfMonth,
             'endDate' => $endOfMonth
         ];
-        
         // Récupérer les temporaires actifs dans ce mois
         $rawTemporaires = DB::table('users')
             ->where('users.societe_id', $societeId)
@@ -1173,327 +1230,79 @@ class SalaryExportController extends Controller
             })
             ->get()
             ->filter(function($u){ return !$this->isPermanent($u); });
-
         $ids = $rawTemporaires->pluck('id')->all();
         $totalCout = 0;
-        
         if (!empty($ids)) {
-            $pointages = DB::table('pointages')
-                ->select('user_id')
-                ->whereIn('user_id', $ids)
-                ->whereBetween('date', [
-                    $startOfMonth->format('Y-m-d'),
-                    $endOfMonth->format('Y-m-d')
-                ])
-                ->whereIn('statutJour', ['present','retard'])
-                ->groupBy('user_id')
-                ->pluck('user_id')
-                ->toArray();
-
-            if (!empty($pointages)) {
+            // Déterminer les utilisateurs ayant au moins un statut present/retard durant le mois via service
+            $presentUserIds = [];
+            foreach ($ids as $uid) {
+                $pts = TimeCalculationService::getUserPointagesGrouped((int)$uid, $monthDateRange);
+                foreach ($pts as $p) {
+                    $st = strtolower(trim((string)($p->statutJour ?? '')));
+                    if (preg_match('/pr[eé]sent|retard/i', $st)) { $presentUserIds[] = $uid; break; }
+                }
+            }
+            if (!empty($presentUserIds)) {
                 $employes = DB::table('users')
                     ->leftJoin('salaires', 'users.id', '=', 'salaires.user_id')
-                    ->whereIn('users.id', $pointages)
+                    ->whereIn('users.id', $presentUserIds)
                     ->select(
                         'users.*',
                         'salaires.salaire_base',
                         DB::raw('COALESCE(salaires.panier, salaires.panier, 0) as panier')
                     )
                     ->get();
-
                 foreach ($employes as $emp) {
                     $detailedStats = \App\Services\TimeCalculationService::computeDetailedTemporaryStats($emp, $monthDateRange);
                     $tauxH = $emp->salaire_base ?? 0;
                     $primePanier = $emp->panier ?? 0;
-                    
                     // Nouveau calcul avec les heures détaillées
                     $coutTotal = ($detailedStats['heures_normales'] * $tauxH)
                         + ($detailedStats['hs_25'] * $tauxH * 1.25)
                         + ($detailedStats['hs_50'] * $tauxH * 1.5)
                         + ($primePanier * $detailedStats['jours_travailles']);
-                        
                     $totalCout += $coutTotal;
                 }
             }
         }
-        
-        return $totalCout;
+                return $totalCout;
     }
-
     public function exportSalaries(Request $request)
     {
         return $this->export($request);
     }
-
-private function createRecapDepartementsSheet($spreadsheet, $societeId, $dateRange)
-{
-    $sheet = $spreadsheet->createSheet();
-    $sheet->setTitle('Recap Départements');
-
-    // Titre
-    $sheet->setCellValue('A1', 'RÉCAPITULATIF PAR DÉPARTEMENT (source: pointages.column_id, règles Monthly)');
-    $sheet->mergeCells('A1:G1');
-    $sheet->getStyle('A1:G1')->applyFromArray([
-        'font' => ['bold' => true, 'size' => 16],
-        'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
-        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'D9EAD3']],
-        'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THICK]]
-    ]);
-
-    // En-têtes
-    $row = 3;
-    $headers = [
-        'AFFECTATION/DÉPARTEMENT (pointage)',
-        'TOTAL EFFECTIF PRÉSENT DURANT LA PÉRIODE',
-        'TOTAL HEURES TRAVAILLÉES',
-        'TOTAL HEURES SUPP',
-        'COÛT',
-        'CHARGES',
-        'COÛT TOTAL'
-    ];
-    foreach ($headers as $i => $h) {
-        $col = chr(65 + $i);
-        $sheet->setCellValue($col.$row, $h);
-    }
-    $sheet->getStyle('A3:G3')->applyFromArray([
-        'font' => ['bold' => true, 'size' => 10],
-        'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
-        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'E8F4FD']],
-        'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
-    ]);
-
-    // Données (par column_id)
-    $departements = $this->getDepartmentStatsByPointageColumn($societeId, $dateRange);
-
-    $row = 4;
-    $totEff = 0; $totH = 0.0; $totHS = 0.0; $totC = 0.0; $totCh = 0.0; $totCT = 0.0;
-    $first = $row;
-    foreach ($departements as $d) {
-        $sheet->fromArray([
-            $d['nom'], $d['effectif'], $d['total_heures'], $d['heures_supp'], $d['cout'], $d['charges'], $d['cout_total']
-        ], null, "A{$row}");
-
-        $totEff += (int)$d['effectif'];
-        $totH   += (float)$d['total_heures'];
-        $totHS  += (float)$d['heures_supp'];
-        $totC   += (float)$d['cout'];
-        $totCh  += (float)$d['charges'];
-        $totCT  += (float)$d['cout_total'];
-
-        $fill = ($row % 2 === 0) ? 'F9F9F9' : 'FFFFFF';
-        $sheet->getStyle("A{$row}:G{$row}")->applyFromArray([
-            'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
-            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $fill]],
-            'alignment' => ['vertical' => Alignment::VERTICAL_CENTER]
-        ]);
-
-        $row++;
-    }
-
-    $last = $row - 1;
-    if ($last >= $first) {
-        $this->formatRange($sheet, "B{$first}:B{$last}", 0);  // effectif
-        $this->formatRange($sheet, "C{$first}:D{$last}", 0);  // heures
-        $this->formatRange($sheet, "E{$first}:G{$last}", 0);  // coûts
-    }
-
-    // Total général
-    $sheet->fromArray(['TOTAL GÉNÉRAL', $totEff, $totH, $totHS, $totC, $totCh, $totCT], null, "A{$row}");
-    $sheet->getStyle("A{$row}:G{$row}")->applyFromArray([
-        'font' => ['bold' => true],
-        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'FFE6CC']],
-        'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THICK]]
-    ]);
-    $this->formatRange($sheet, "B{$row}:B{$row}", 0);
-    $this->formatRange($sheet, "C{$row}:D{$row}", 0);
-    $this->formatRange($sheet, "E{$row}:G{$row}", 0);
-
-    foreach (range('A','G') as $col) $sheet->getColumnDimension($col)->setAutoSize(true);
-    $sheet->freezePane('A4');
-}
-
-    private function getDepartmentStatsByPointageColumn($societeId, $dateRange): array
-{
-    // 1) Lister les départements vus dans les pointages de la période
-    $deptRows = DB::table('pointages')
-        ->leftJoin('users','pointages.user_id','=','users.id')
-        ->leftJoin('departements','pointages.departement_id','=','departements.id')
-        ->where('users.societe_id',$societeId)
-        ->whereBetween('pointages.date', [
-            $dateRange['startDate']->format('Y-m-d'),
-            $dateRange['endDate']->format('Y-m-d')
-        ])
-        ->whereIn('pointages.statutJour',['present','retard'])
-        ->select(
-            'pointages.departement_id',
-            DB::raw("UPPER(TRIM(COALESCE(NULLIF(TRIM(departements.nom), ''), 'NON AFFECTÉ'))) as dept_nom")
-        )
-        ->groupBy('pointages.departement_id','departements.nom')
-        ->get();
-
-        $departements=[];
-        foreach ($deptRows as $dr) {
-            $label = strtoupper(trim((string)$dr->dept_nom));
-            // NA si id null/0 OU nom vide/"NON AFFECTÉ"
-            $isNA = (is_null($dr->departement_id) || (int)$dr->departement_id === 0 || $label === 'NON AFFECTÉ');
-            $key  = $isNA ? 'NA' : (string)$dr->departement_id;
-            $departements[$key]=[
-                'departement_id' => $isNA ? null : (int)$dr->departement_id,
-                'nom'            => $label ?: 'NON AFFECTÉ',
-                'effectif'       => 0,
-                'total_heures'   => 0.0,
-                'heures_supp'    => 0.0,
-                'cout'           => 0.0,
-                'charges'        => 0.0,
-                'cout_total'     => 0.0,
-            ];
-        }
-    if (empty($departements)) return [];
-
-    // 2) Récupérer tous les utilisateurs (cache)
-    $users = DB::table('users')
-        ->leftJoin('salaires','users.id','=','salaires.user_id')
-        ->where('users.societe_id',$societeId)
-        ->select(
-            'users.*',
-            DB::raw('COALESCE(salaires.salaire_base,0) as salaire_base'),
-            DB::raw('COALESCE(salaires.panier,0) as panier')
-        )->get()->keyBy('id');
-
-    // 3) Calcul pour chaque département
-        foreach ($departements as $deptKey=>&$dept) {
-            $deptId = $dept['departement_id'];
-
-        // Liste des utilisateurs ayant travaillé dans ce département
-            $userQuery = DB::table('pointages')
-                ->whereBetween('date', [
-                    $dateRange['startDate']->format('Y-m-d'),
-                    $dateRange['endDate']->format('Y-m-d')
-                ])
-                ->whereIn('statutJour',['present','retard']);
-            if (is_null($deptId)) {
-                $userQuery->where(function($q){
-                    $q->whereNull('departement_id')->orWhere('departement_id', 0);
-                });
-            } else {
-                $userQuery->where('departement_id', $deptId);
-            }
-            $userIds = $userQuery->distinct()->pluck('user_id')->toArray();
-
-        $dept['effectif'] = count($userIds);
-
-        foreach ($userIds as $uid) {
-            $u = $users[$uid] ?? null; if (!$u) continue;
-
-            if ($this->isPermanent($u)) {
-                // Permanents — appliquer les mêmes règles que Monthly (HS si >8h et base nuit <8, dimanche/jour férié gérés)
-                $stats = $this->getDataFromMonthlyExportForDepartement($u, $dateRange, $deptId);
-                $total = (float)($stats['total_heures'] ?? 0);
-                $hs    = (float)($stats['heures_supp']   ?? 0);
-                $hn    = max(0.0, $total - $hs);
-
-                $taux    = ((float)$u->salaire_base) / 173.33;
-                $cout    = ($hn * $taux) + ($hs * $taux * 1.5);
-                $charges = $cout * 0.21;
-
-                $dept['total_heures'] += $total;
-                $dept['heures_supp']  += $hs;
-                $dept['cout']         += $cout;
-                $dept['charges']      += $charges;
-                $dept['cout_total']   += ($cout + $charges);
-
-            } else {
-                // Temporaires
-                $d    = $this->computeDetailedTemporaryStatsForDepartement($u, $dateRange, $deptId);
-                $hn   = (float)$d['heures_normales'];
-                $hs25 = (float)$d['hs_25'];
-                $hs50 = (float)$d['hs_50'];
-                $hs   = $hs25 + $hs50;
-                $tot  = $hn + $hs;
-
-                $tauxH   = (float)$u->salaire_base;
-                $panier  = (float)$u->panier;
-                $jours   = (int)$d['jours_travailles'];
-
-                $cout    = ($hn * $tauxH) + ($hs25 * $tauxH * 1.25) + ($hs50 * $tauxH * 1.5) + ($panier * $jours);
-                $charges = $cout * 0.21;
-
-                $dept['total_heures'] += $tot;
-                $dept['heures_supp']  += $hs;
-                $dept['cout']         += $cout;
-                $dept['charges']      += $charges;
-                $dept['cout_total']   += ($cout + $charges);
-            }
-        }
-    }
-
-    return array_values($departements);
-}
-
-private function resolvePointageColumnLookup(): ?array
-{
-    // Liste de tables/colonnes possibles : adapte si besoin
-    $candidates = [
-        // table,         id,     label
-        ['pointage_columns','id', 'nom'],
-        ['pointage_columns','id', 'name'],
-        ['columns_pointage','id', 'nom'],
-        ['columns_pointage','id', 'name'],
-        ['board_columns',  'id',  'title'],
-        ['departements',   'id',  'nom'],   // parfois column_id = departement_id
-        ['departments',    'id',  'name'],
-    ];
-
-    foreach ($candidates as [$table,$id,$label]) {
-        if (Schema::hasTable($table) && Schema::hasColumn($table, $id) && Schema::hasColumn($table, $label)) {
-            return ['table'=>$table,'id'=>$id,'label'=>$label];
-        }
-    }
-    return null; // pas de table trouvée → on n'utilise pas de jointure
-}
-
-
-
     /**
      * Vérifier si un utilisateur a des pointages dans la période donnée
      */
     private function hasPointagesInPeriod($userId, $dateRange)
 {
-    $start = $dateRange['startDate']->format('Y-m-d');
-    $end   = $dateRange['endDate']->format('Y-m-d');
-
-    return DB::table('pointages')
-        ->where('user_id', $userId)
-        ->whereDate('date', '>=', $start)
-        ->whereDate('date', '<=', $end)
-        ->whereIn('statutJour', ['present','retard'])
-        ->exists();
+    return \App\Services\TimeCalculationService::hasPointagesInPeriod((int)$userId, $dateRange);
 }
 // Temporaires — règles Monthly, filtrées par column_id
 private function computeDetailedTemporaryStatsForColumn($user, $dateRange, $columnId): array
 {
     $hn=0.0; $hs25=0.0; $hs50=0.0; $tot=0.0; $jours=0;
-
-    $joursFeries = JourFerie::whereBetween('date', [
-        $dateRange['startDate']->format('Y-m-d'), $dateRange['endDate']->format('Y-m-d')
-    ])->where('actif', true)->pluck('date')->map(fn($d)=>date('Y-m-d',strtotime($d)))->toArray();
-
+    $joursFeries = TimeCalculationService::getHolidays($dateRange);
+    $groupedPointages = TimeCalculationService::getUserPointagesGrouped((int)$user->id, $dateRange);
+    $byDate = [];
+    foreach ($groupedPointages as $pt) {
+        $d = $pt->date;
+        if (!isset($byDate[$d])) $byDate[$d] = [];
+        $byDate[$d][] = $pt;
+    }
     $d = clone $dateRange['startDate'];
     while ($d <= $dateRange['endDate']) {
         $ds = $d->format('Y-m-d');
         $isHoliday = in_array($ds,$joursFeries,true);
         $isSunday = ((int)$d->format('w')===0);
-
         // congé ?
         $conge = DB::table('absence_requests')
             ->where('user_id',$user->id)->whereIn('type',['Congé','maladie'])
             ->where('statut','approuvé')->whereDate('dateDebut','<=',$ds)->whereDate('dateFin','>=',$ds)->first();
         if ($conge){ $d->modify('+1 day'); continue; }
-
-        $pts = DB::table('pointages')
-            ->where('user_id',$user->id)->where('column_id',$columnId)
-            ->whereDate('date',$ds)->get();
-
+        $pts = array_values(array_filter($byDate[$ds] ?? [], function($p) use ($columnId) {
+            return ((int)($p->column_id ?? 0)) === (int)$columnId;
+        }));
         $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pts);
         if ($daily > 0){
             $jours++; $tot += $daily;
@@ -1512,18 +1321,19 @@ private function computeDetailedTemporaryStatsForColumn($user, $dateRange, $colu
 private function computeDetailedTemporaryStatsForDepartement($user, $dateRange, $departementId): array
 {
     $hn=0.0; $hs25=0.0; $hs50=0.0; $tot=0.0; $jours=0;
-
-    $joursFeries = JourFerie::whereBetween('date', [
-        $dateRange['startDate']->format('Y-m-d'),
-        $dateRange['endDate']->format('Y-m-d')
-    ])->where('actif', true)->pluck('date')->map(fn($d)=>date('Y-m-d',strtotime($d)))->toArray();
-
+    $joursFeries = TimeCalculationService::getHolidays($dateRange);
+    $groupedPointages = TimeCalculationService::getUserPointagesGrouped((int)$user->id, $dateRange);
+    $byDate = [];
+    foreach ($groupedPointages as $pt) {
+        $d = $pt->date;
+        if (!isset($byDate[$d])) $byDate[$d] = [];
+        $byDate[$d][] = $pt;
+    }
     $d = clone $dateRange['startDate'];
     while ($d <= $dateRange['endDate']) {
         $ds = $d->format('Y-m-d');
         $isHoliday = in_array($ds,$joursFeries,true);
         $isSunday = ((int)$d->format('w')===0);
-
         $conge = DB::table('absence_requests')
             ->where('user_id',$user->id)
             ->whereIn('type',['Congé','maladie'])
@@ -1532,17 +1342,12 @@ private function computeDetailedTemporaryStatsForDepartement($user, $dateRange, 
             ->whereDate('dateFin','>=',$ds)
             ->first();
         if ($conge){ $d->modify('+1 day'); continue; }
-
-        $ptsQ = DB::table('pointages')
-            ->where('user_id',$user->id)
-            ->whereDate('date',$ds);
-        if (is_null($departementId)) {
-            $ptsQ->where(function($q){ $q->whereNull('departement_id')->orWhere('departement_id',0); });
-        } else {
-            $ptsQ->where('departement_id',$departementId);
-        }
-        $pts = $ptsQ->get();
-
+        $pts = array_values(array_filter($byDate[$ds] ?? [], function($p) use ($departementId) {
+            if (is_null($departementId)) {
+                return !isset($p->departement_id) || $p->departement_id === null || (int)$p->departement_id === 0;
+            }
+            return ((int)($p->departement_id ?? 0)) === (int)$departementId;
+        }));
         $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pts);
         if ($daily > 0){
             $jours++; $tot += $daily;
@@ -1555,7 +1360,6 @@ private function computeDetailedTemporaryStatsForDepartement($user, $dateRange, 
         }
         $d->modify('+1 day');
     }
-
     return [
         'heures_normales'=>$hn,
         'hs_25'=>$hs25,
@@ -1566,29 +1370,27 @@ private function computeDetailedTemporaryStatsForDepartement($user, $dateRange, 
 }
 private function getDataFromMonthlyExportForDepartement($user, $dateRange, $departementId): array
 {
-    $joursFeries = JourFerie::whereBetween('date', [
-        $dateRange['startDate']->format('Y-m-d'),
-        $dateRange['endDate']->format('Y-m-d')
-    ])->where('actif', true)->pluck('date')->map(fn($d)=>date('Y-m-d',strtotime($d)))->toArray();
-
+    // Jours fériés et pointages groupés via service
+    $joursFeries = TimeCalculationService::getHolidays($dateRange);
+    $groupedPointages = TimeCalculationService::getUserPointagesGrouped((int)$user->id, $dateRange);
+    $byDate = [];
+    foreach ($groupedPointages as $pt) {
+        $d = $pt->date;
+        if (!isset($byDate[$d])) $byDate[$d] = [];
+        $byDate[$d][] = $pt;
+    }
     $totalHeures=0.0; $heuresSupp=0.0; $joursTravailles=0;
-
     $d = clone $dateRange['startDate'];
     while ($d <= $dateRange['endDate']) {
         $ds = $d->format('Y-m-d');
         $dow=(int)$d->format('w');
         $isHoliday=in_array($ds,$joursFeries,true);
-
-        $ptsQ = DB::table('pointages')
-            ->where('user_id',$user->id)
-            ->whereDate('date',$ds);
-        if (is_null($departementId)) {
-            $ptsQ->where(function($q){ $q->whereNull('departement_id')->orWhere('departement_id',0); });
-        } else {
-            $ptsQ->where('departement_id',$departementId);
-        }
-        $pts = $ptsQ->get();
-
+        $pts = array_values(array_filter($byDate[$ds] ?? [], function($p) use ($departementId) {
+            if (is_null($departementId)) {
+                return !isset($p->departement_id) || $p->departement_id === null || (int)$p->departement_id === 0;
+            }
+            return ((int)($p->departement_id ?? 0)) === (int)$departementId;
+        }));
         $conge = DB::table('absence_requests')
             ->where('user_id',$user->id)
             ->whereIn('type',['Congé','maladie'])
@@ -1597,10 +1399,8 @@ private function getDataFromMonthlyExportForDepartement($user, $dateRange, $depa
             ->whereDate('dateFin','>=',$ds)
             ->first();
         if ($conge){ $d->modify('+1 day'); continue; }
-
         $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pts);
-        $nightBase = $this->calculateNightBaseHours($pts);
-
+        $nightBase = TimeCalculationService::calculateNightBaseHours($pts);
         if ($isHoliday) {
             if ($daily > 0) {
                 $totalHeures += $daily;
@@ -1616,41 +1416,37 @@ private function getDataFromMonthlyExportForDepartement($user, $dateRange, $depa
         }
         $d->modify('+1 day');
     }
-
     return [
         'total_heures'=>$totalHeures,
         'heures_supp'=>$heuresSupp,
         'jours_travailles'=>$joursTravailles
     ];
 }
-
-
 // Permanents — règles Monthly, filtrées par column_id
 private function getDataFromMonthlyExportForColumn($user, $dateRange, $columnId): array
 {
-    $joursFeries = JourFerie::whereBetween('date', [
-        $dateRange['startDate']->format('Y-m-d'), $dateRange['endDate']->format('Y-m-d')
-    ])->where('actif', true)->pluck('date')->map(fn($d)=>date('Y-m-d',strtotime($d)))->toArray();
-
+    $joursFeries = TimeCalculationService::getHolidays($dateRange);
+    $groupedPointages = TimeCalculationService::getUserPointagesGrouped((int)$user->id, $dateRange);
+    $byDate = [];
+    foreach ($groupedPointages as $pt) {
+        $d = $pt->date;
+        if (!isset($byDate[$d])) $byDate[$d] = [];
+        $byDate[$d][] = $pt;
+    }
     $totalHeures=0.0; $heuresSupp=0.0; $joursTravailles=0;
-
     $d = clone $dateRange['startDate'];
     while ($d <= $dateRange['endDate']) {
         $ds = $d->format('Y-m-d'); $dow=(int)$d->format('w');
         $isHoliday=in_array($ds,$joursFeries,true);
-
-        $pts = DB::table('pointages')
-            ->where('user_id',$user->id)->where('column_id',$columnId)
-            ->whereDate('date',$ds)->get();
-
+        $pts = array_values(array_filter($byDate[$ds] ?? [], function($p) use ($columnId) {
+            return ((int)($p->column_id ?? 0)) === (int)$columnId;
+        }));
         $conge = DB::table('absence_requests')
             ->where('user_id',$user->id)->whereIn('type',['Congé','maladie'])
             ->where('statut','approuvé')->whereDate('dateDebut','<=',$ds)->whereDate('dateFin','>=',$ds)->first();
         if ($conge){ $d->modify('+1 day'); continue; }
-
         $daily = TimeCalculationService::computeDailyTotalHoursForTemporary($pts);
-        $nightBase = $this->calculateNightBaseHours($pts);
-
+        $nightBase = TimeCalculationService::calculateNightBaseHours($pts);
         if ($isHoliday) {
             if ($daily > 0) {
                 $totalHeures += $daily; $joursTravailles += 1;
@@ -1667,5 +1463,4 @@ private function getDataFromMonthlyExportForColumn($user, $dateRange, $columnId)
     }
     return ['total_heures'=>$totalHeures,'heures_supp'=>$heuresSupp,'jours_travailles'=>$joursTravailles];
 }
-
 }
