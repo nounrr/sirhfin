@@ -254,9 +254,10 @@ private function presenceStartCol(bool $isPermanent): int
         $sheet->mergeCells('P3:Q3');
         $sheet->setCellValue('P3', 'CNSS PARTS PATRONALES');
     $sheet->setCellValue('R3', 'COÛT TOTAL PAR SALARIÉS');
+    $sheet->setCellValue('S3', 'SALAIRE NET TOTAL');
     // Colonnes helpers cachées pour heures mensuelles (permanents) afin d'alimenter les récapitulatifs
-    $sheet->setCellValue('S3', 'HN MOIS');
-    $sheet->setCellValue('T3', 'HS MOIS');
+    $sheet->setCellValue('T3', 'HN MOIS');
+    $sheet->setCellValue('U3', 'HS MOIS');
         // Sous-en-têtes (ligne 4)
         $sheet->setCellValue('A4', ''); // Matricules
         $sheet->setCellValue('B4', ''); // Noms
@@ -279,8 +280,9 @@ private function presenceStartCol(bool $isPermanent): int
         $sheet->setCellValue('P4', '8.98%');
         $sheet->setCellValue('Q4', '12.11%');
     $sheet->setCellValue('R4', ''); // Coût total
-    $sheet->setCellValue('S4', ''); // HN helper
-    $sheet->setCellValue('T4', ''); // HS helper
+    $sheet->setCellValue('S4', ''); // Salaire net total
+    $sheet->setCellValue('T4', ''); // HN helper
+    $sheet->setCellValue('U4', ''); // HS helper
         // Fusionner les cellules qui n'ont pas de sous-cellules (de ligne 3 à 4)
         $sheet->mergeCells('A3:A4');
         $sheet->mergeCells('B3:B4');
@@ -290,8 +292,9 @@ private function presenceStartCol(bool $isPermanent): int
         $sheet->mergeCells('F3:F4');
         $sheet->mergeCells('K3:K4');
         $sheet->mergeCells('R3:R4');
+        $sheet->mergeCells('S3:S4');
         // Style des en-têtes
-        $sheet->getStyle('A3:T4')->applyFromArray([
+        $sheet->getStyle('A3:U4')->applyFromArray([
             'font' => ['bold' => true, 'size' => 10],
             'alignment' => [
                 'horizontal' => Alignment::HORIZONTAL_CENTER,
@@ -301,8 +304,19 @@ private function presenceStartCol(bool $isPermanent): int
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
         ]);
         // Ajouter AutoFilter pour les en-têtes
-    $sheet->setAutoFilter('A4:R4');
+    $sheet->setAutoFilter('A4:S4');
         $row = 5;
+        
+        // Calculer les colonnes dynamiques pour les permanents dans 'Employés Permanents'
+        // Structure : A=Nom, B=Fonction, C=Département, puis présence à partir de colonne 4 (D)
+        $permPresenceStart = 4;
+        $permPresenceEnd = $permPresenceStart + $dateRange['totalDays'] - 1;
+        $permTotalsStart = $permPresenceEnd + 1;
+        // Colonne Total Jours Travaillés = +3 (Absences +0, Jour Recup +1, Congés +2, Total Jours +3)
+        $permColJoursTrav = $permTotalsStart + 3;
+        // Convertir en lettre de colonne
+        $permColJoursTravLetter = Coordinate::stringFromColumnIndex($permColJoursTrav);
+        
         // Ajouter les données des employés
         foreach ($employes as $emp) {
             // Calculer les jours travaillés et congés pour cet employé
@@ -312,10 +326,13 @@ private function presenceStartCol(bool $isPermanent): int
             if ($deptLabel === '' || $deptLabel === 'NON DEFINI' || $deptLabel === 'NON DÉFINI' || $deptLabel === 'NON-DEFINI') {
                 $deptLabel = 'NON AFFECTÉ';
             }
-           $formulaJoursTravailles = sprintf(
-    "=IFERROR(XLOOKUP(B%d,'Employés Permanents'!A:A,'Employés Permanents'!AL:AL,0),0)",
-    $row
-);
+            // Formule XLOOKUP avec colonne DYNAMIQUE
+            $formulaJoursTravailles = sprintf(
+                "=IFERROR(XLOOKUP(B%d,'Employés Permanents'!A:A,'Employés Permanents'!%s:%s,0),0)",
+                $row,
+                $permColJoursTravLetter,
+                $permColJoursTravLetter
+            );
             $data = [
                 $emp->id, // Matricule
                 strtoupper(trim(($emp->name ?? '') . ' ' . ($emp->prenom ?? ''))), // Noms et prénoms
@@ -343,11 +360,15 @@ private function presenceStartCol(bool $isPermanent): int
             $permanentStats = $this->getDataFromMonthlyExport($emp, $dateRange, true);
             $hn = max(0, ($permanentStats['total_heures'] ?? 0) - ($permanentStats['heures_supp'] ?? 0));
             $hs = max(0, ($permanentStats['heures_supp'] ?? 0));
-            $sheet->setCellValue('S'.$row, $hn);
-            $sheet->setCellValue('T'.$row, $hs);
+            // Colonne S: Salaire net total calculé
+            // Formule qui calcule le salaire réel en fonction des jours travaillés
+            $sheet->setCellValue('S'.$row, "=IF(E{$row}>0, G{$row}*E{$row}/26, G{$row})");
+            // Colonnes T et U: helpers cachés pour HN/HS
+            $sheet->setCellValue('T'.$row, $hn);
+            $sheet->setCellValue('U'.$row, $hs);
             // Style alterné pour les lignes
             $fillColor = ($row % 2 === 0) ? 'F9F9F9' : 'FFFFFF';
-            $sheet->getStyle('A' . $row . ':T' . $row)->applyFromArray([
+            $sheet->getStyle('A' . $row . ':S' . $row)->applyFromArray([
                 'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
                 'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $fillColor]],
                 'alignment' => ['vertical' => Alignment::VERTICAL_CENTER]
@@ -364,16 +385,18 @@ private function presenceStartCol(bool $isPermanent): int
             $this->formatRange($sheet, 'G' . $firstDataRow . ':H' . $lastDataRow, 0);
             // R (coût total) si rempli plus tard, garder format entier
             $this->formatRange($sheet, 'R' . $firstDataRow . ':R' . $lastDataRow, 0);
-            // Helpers HN/HS
-            $this->formatRange($sheet, 'S' . $firstDataRow . ':T' . $lastDataRow, 0);
+            // S (Salaire net total) format entier
+            $this->formatRange($sheet, 'S' . $firstDataRow . ':S' . $lastDataRow, 0);
+            // Helpers HN/HS cachés
+            $this->formatRange($sheet, 'T' . $firstDataRow . ':U' . $lastDataRow, 0);
         }
         // Auto-ajuster les colonnes
-        foreach (range('A', 'R') as $col) {
+        foreach (range('A', 'S') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
-        // Cacher les colonnes helpers
-        $sheet->getColumnDimension('S')->setVisible(false);
+        // Cacher les colonnes helpers T et U (HN/HS)
         $sheet->getColumnDimension('T')->setVisible(false);
+        $sheet->getColumnDimension('U')->setVisible(false);
         $sheet->freezePane('A5');
     }
     private function createSalaireTemporaireSheet($spreadsheet, $societeId, $dateRange)
@@ -460,8 +483,11 @@ private function presenceStartCol(bool $isPermanent): int
     // K: Salaire net (fusion K3:K4)
     $sheet->setCellValue('K3', 'SALAIRE NET');
     $sheet->mergeCells('K3:K4');
+    // L: Helper caché pour Recap (fusion L3:L4)
+    $sheet->setCellValue('L3', 'SALAIRE TOTAL');
+    $sheet->mergeCells('L3:L4');
         // Style en-têtes
-    $sheet->getStyle('A3:K4')->applyFromArray([
+    $sheet->getStyle('A3:L4')->applyFromArray([
             'font' => ['bold' => true, 'size' => 10],
             'alignment' => [
                 'horizontal' => Alignment::HORIZONTAL_CENTER,
@@ -470,8 +496,24 @@ private function presenceStartCol(bool $isPermanent): int
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'E1F5FE']],
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]]
         ]);
-    $sheet->setAutoFilter('A4:K4');
+    $sheet->setAutoFilter('A4:L4');
         $row = 5;
+        
+        // Calculer les colonnes dynamiques pour les temporaires dans 'Employés Temporaires'
+        // Structure de la feuille "Employés Temporaires" : A=Nom, B=Prénom, C=Fonction, D=Département
+        // Puis présence à partir de colonne 5 (E)
+        $tempPresenceStart = 5;
+        $tempPresenceEnd = $tempPresenceStart + $dateRange['totalDays'] - 1;
+        $tempTotalsStart = $tempPresenceEnd + 1;
+        // Colonnes des totaux temporaires : HN (+0), HS25 (+1), HS50 (+2)
+        $tempColHN = $tempTotalsStart + 0;
+        $tempColHS25 = $tempTotalsStart + 1;
+        $tempColHS50 = $tempTotalsStart + 2;
+        // Convertir en lettres de colonnes
+        $tempColHNLetter = Coordinate::stringFromColumnIndex($tempColHN);
+        $tempColHS25Letter = Coordinate::stringFromColumnIndex($tempColHS25);
+        $tempColHS50Letter = Coordinate::stringFromColumnIndex($tempColHS50);
+        
         // Pour récupérer les valeurs détaillées des heures, on va calculer les nouvelles métriques
         foreach ($employes as $emp) {
             $detailedStats = \App\Services\TimeCalculationService::computeDetailedTemporaryStats($emp, $dateRange);
@@ -485,10 +527,10 @@ private function presenceStartCol(bool $isPermanent): int
                 + ($detailedStats['hs_50'] * $tauxH * 1.5)
                 + ($primePanier * $detailedStats['jours_travailles']);
             // Set row cells individually so we can put a formula for Salaire Net (col J)
-            // === Formules de récupération depuis la feuille "Employés Temporaires" ===
-            $hnFormula   = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!AJ:AJ, 0), 0)", $row);
-$hs25Formula = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!AK:AK, 0), 0)", $row);
-$hs50Formula = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!AL:AL, 0), 0)", $row);
+            // === Formules de récupération depuis la feuille "Employés Temporaires" avec colonnes DYNAMIQUES ===
+            $hnFormula   = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!%s:%s, 0), 0)", $row, $tempColHNLetter, $tempColHNLetter);
+            $hs25Formula = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!%s:%s, 0), 0)", $row, $tempColHS25Letter, $tempColHS25Letter);
+            $hs50Formula = sprintf("=IFERROR(XLOOKUP(A%d, UPPER(TRIM('Employés Temporaires'!A:A&\" \"&'Employés Temporaires'!B:B)), 'Employés Temporaires'!%s:%s, 0), 0)", $row, $tempColHS50Letter, $tempColHS50Letter);
 
 
             
@@ -512,8 +554,10 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
             // Salaire net formula: =D{row}*I{row} + E{row}*I{row}*1.25 + F{row}*I{row}*1.5 + H{row}*J{row}
             $formula = sprintf('=D%1$d*I%1$d + E%1$d*I%1$d*1.25 + F%1$d*I%1$d*1.5 + H%1$d*J%1$d', $row);
             $sheet->setCellValue('K' . $row, $formula);
+            // Colonne L: Helper pour Recap (même valeur que K)
+            $sheet->setCellValue('L' . $row, "=K{$row}");
             $fillColor = ($row % 2 === 0) ? 'F9F9F9' : 'FFFFFF';
-            $sheet->getStyle('A' . $row . ':J' . $row)->applyFromArray([
+            $sheet->getStyle('A' . $row . ':L' . $row)->applyFromArray([
                 'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN]],
                 'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $fillColor]],
                 'alignment' => ['vertical' => Alignment::VERTICAL_CENTER]
@@ -529,11 +573,13 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
             // Jours H entier
             $this->formatRange($sheet, 'H' . $firstDataRow . ':H' . $lastDataRow, 0);
             // Taux H, Panier et Salaire net (I..K) entier pour affichage
-            $this->formatRange($sheet, 'I' . $firstDataRow . ':K' . $lastDataRow, 0);
+            $this->formatRange($sheet, 'I' . $firstDataRow . ':L' . $lastDataRow, 0);
         }
-        foreach (range('A','J') as $col) {
+        foreach (range('A','K') as $col) {
             $sheet->getColumnDimension($col)->setAutoSize(true);
         }
+        // Cacher la colonne helper L
+        $sheet->getColumnDimension('L')->setVisible(false);
         $sheet->freezePane('A5');
     }
     // computeDailyRawHours and checkNightOverlap are provided by TimeCalculationService
@@ -916,9 +962,9 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
                     $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->salaire_permanent : 0;
                     $sheet->setCellValue($colLetterDB . $row, $value);
                     
-                    // Colonne EXCEL: formule (uniquement pour mois exporté)
+                    // Colonne EXCEL: formule utilisant colonne S (SALAIRE NET TOTAL visible) au lieu de G (dynamique)
                     if ($hasExcel) {
-                        $sheet->setCellValue($colLetterExcel . $row, "=IFERROR(SUM('Salaire Permanent'!G:G),0)");
+                        $sheet->setCellValue($colLetterExcel . $row, "=IFERROR(SUM('Salaire Permanent'!S:S),0)");
                     }
                     
                 } elseif ($rowLabel === 'CHARGES PERMANENT') {
@@ -937,9 +983,9 @@ $sheet->setCellValue('F' . $row, $hs50Formula);
                     $value = isset($chargeData[$m]) ? (float)$chargeData[$m]->salaire_temporaire : 0;
                     $sheet->setCellValue($colLetterDB . $row, $value);
                     
-                    // Colonne EXCEL: formule (uniquement pour mois exporté)
+                    // Colonne EXCEL: formule utilisant colonne helper L (fixe) au lieu de K (dynamique)
                     if ($hasExcel) {
-                        $sheet->setCellValue($colLetterExcel . $row, "=IFERROR(SUM('Salaire Temporaire'!K:K),0)");
+                        $sheet->setCellValue($colLetterExcel . $row, "=IFERROR(SUM('Salaire Temporaire'!L:L),0)");
                     }
                     
                 } elseif ($rowLabel === 'CHARGES TEMPORAIRE') {
@@ -1165,11 +1211,11 @@ private function createRecapSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $spreads
     $tempSalLastRow = $tempSalSheet ? max($dataStartRowSal, (int)$tempSalSheet->getHighestDataRow()) : $dataStartRowSal;
     $permSalName = $permSalSheet ? $permSalSheet->getTitle() : null;
     $tempSalName = $tempSalSheet ? $tempSalSheet->getTitle() : null;
-    // Plages: Département et Salaire dans feuilles salaires (D/G pour permanents, C/K pour temporaires)
+    // Plages: Département et Salaire dans feuilles salaires (D/S pour permanents, C/L pour temporaires)
     $permSalDeptRange = "D{$dataStartRowSal}:D{$permSalLastRow}";
-    $permSalValRange  = "G{$dataStartRowSal}:G{$permSalLastRow}"; // SALAIRE NET 26J
+    $permSalValRange  = "S{$dataStartRowSal}:S{$permSalLastRow}"; // SALAIRE NET TOTAL (colonne S)
     $tempSalDeptRange = "C{$dataStartRowSal}:C{$tempSalLastRow}";
-    $tempSalValRange  = "K{$dataStartRowSal}:K{$tempSalLastRow}"; // SALAIRE NET calculé
+    $tempSalValRange  = "L{$dataStartRowSal}:L{$tempSalLastRow}"; // SALAIRE NET (colonne L)
 
     // Lignes par département
     foreach ($departements as $dept) {
