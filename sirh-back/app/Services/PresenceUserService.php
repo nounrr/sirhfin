@@ -20,14 +20,25 @@ class PresenceUserService
     /**
      * Prépare les collections d'utilisateurs pour les exports de présence/salaires.
      * Retourne: all, permanent, temporary, inactive
+     * 
+     * @param int $societeId ID de la société
+     * @param array $excludedUserIds IDs des utilisateurs à exclure
+     * @param int|null $departementId Filtre optionnel par département
+     * @param int|null $userId Filtre optionnel par utilisateur spécifique
      */
-    public function getPresenceUserCollections(int $societeId, array $excludedUserIds = []): array
+    public function getPresenceUserCollections(int $societeId, array $excludedUserIds = [], ?int $departementId = null, ?int $userId = null): array
     {
         $users = DB::table('users')
             ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
             ->where('users.societe_id', $societeId)
             ->when(!empty($excludedUserIds), function($q) use ($excludedUserIds){
                 $q->whereNotIn('users.id', $excludedUserIds);
+            })
+            ->when($departementId, function($q) use ($departementId) {
+                $q->where('users.departement_id', $departementId);
+            })
+            ->when($userId, function($q) use ($userId) {
+                $q->where('users.id', $userId);
             })
             ->select('users.*', 'departements.nom as departement_nom')
             ->get();

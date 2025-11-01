@@ -1,29 +1,60 @@
 
-import React, { useState } from 'react';
-import { useSelector } from 'react-redux';
+import React, { useState, useEffect, useMemo } from 'react';
+import { useSelector, useDispatch } from 'react-redux';
 import { format } from 'date-fns';
 import { toast } from 'react-toastify';
 import api from '../config/axios';
 import './PointagesPageExport.css';
 import Swal from 'sweetalert2';
+import { fetchDepartments } from '../Redux/Slices/departementSlice';
+import { fetchUsers } from '../Redux/Slices/userSlice';
 
 const PointagesPageExport = () => {
+  const dispatch = useDispatch();
   const [exportType, setExportType] = useState('tous'); // scope (all, day, period, month)
   const [dataset, setDataset] = useState('pointages'); // 'pointages' | 'salaires'
   const [dateDebut, setDateDebut] = useState(new Date());
   const [dateFin, setDateFin] = useState(new Date());
   const [mois, setMois] = useState(format(new Date(), 'yyyy-MM'));
+  const [selectedDepartement, setSelectedDepartement] = useState('');
+  const [selectedUser, setSelectedUser] = useState('');
 
   // Vérifier si l'utilisateur a le rôle RH
   const roles = useSelector((state) => state.auth.roles || []);
   const isRH = roles.includes('RH');
+  
+  // Récupérer les départements et utilisateurs depuis Redux
+  const departements = useSelector((state) => state.departments.items || []);
+  const allUsers = useSelector((state) => state.users.items || []);
+  const societeId = useSelector((state) => state.auth.user?.societe_id);
+
+  // Charger les départements et utilisateurs au montage
+  useEffect(() => {
+    if (societeId) {
+      dispatch(fetchDepartments());
+      dispatch(fetchUsers());
+    }
+  }, [dispatch, societeId]);
+
+  // Filtrer les utilisateurs par département
+  const filteredUsers = useMemo(() => {
+    if (!selectedDepartement) {
+      return allUsers;
+    }
+    return allUsers.filter(user => user.departement_id === parseInt(selectedDepartement));
+  }, [allUsers, selectedDepartement]);
 
   // Si l'utilisateur n'est pas RH et que salaires est sélectionné, revenir à pointages
-  React.useEffect(() => {
+  useEffect(() => {
     if (!isRH && dataset === 'salaires') {
       setDataset('pointages');
     }
   }, [isRH, dataset]);
+
+  // Réinitialiser l'utilisateur sélectionné quand le département change
+  useEffect(() => {
+    setSelectedUser('');
+  }, [selectedDepartement]);
 
   const handleExport = async () => {
     let swalLoading;
@@ -50,6 +81,14 @@ const PointagesPageExport = () => {
         params.endDate = format(dateFin, 'yyyy-MM-dd');
       } else if (exportType === 'mois') {
         params.month = mois;
+      }
+
+      // Ajouter les filtres département et utilisateur
+      if (selectedDepartement) {
+        params.departement_id = selectedDepartement;
+      }
+      if (selectedUser) {
+        params.user_id = selectedUser;
       }
   
       const endpoint = dataset === 'salaires' ? '/export-salaires' : '/export-pointages';
@@ -188,6 +227,47 @@ const PointagesPageExport = () => {
             </div>
           </div>
         )}
+
+        {/* Filtre par département */}
+        <div className="export-item">
+          <div className="form-control">
+            <label htmlFor="departement">Département (optionnel)</label>
+            <select
+              id="departement"
+              value={selectedDepartement}
+              onChange={(e) => setSelectedDepartement(e.target.value)}
+              className="select-input"
+            >
+              <option value="">Tous les départements</option>
+              {departements.map((dept) => (
+                <option key={dept.id} value={dept.id}>
+                  {dept.nom}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Filtre par utilisateur */}
+        <div className="export-item">
+          <div className="form-control">
+            <label htmlFor="user">Utilisateur (optionnel)</label>
+            <select
+              id="user"
+              value={selectedUser}
+              onChange={(e) => setSelectedUser(e.target.value)}
+              className="select-input"
+              disabled={filteredUsers.length === 0}
+            >
+              <option value="">Tous les utilisateurs</option>
+              {filteredUsers.map((user) => (
+                <option key={user.id} value={user.id}>
+                  {user.name} {user.prenom}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
 
         <div className="export-item full-width">
           <button className="export-button" onClick={handleExport}>

@@ -180,8 +180,18 @@ private function col(int $i): string {
         $spreadsheet = new Spreadsheet();
         // Utilisateurs préparés via helper réutilisable
         $userAuth = Auth::user();
-    // Déléguer la construction des collections au service réutilisable
-    $presenceCollections = (new PresenceUserService())->getPresenceUserCollections($userAuth->societe_id, $this->excludedUserIds);
+        
+        // Récupérer les filtres optionnels
+        $departementId = $request->input('departement_id') ? (int)$request->input('departement_id') : null;
+        $userId = $request->input('user_id') ? (int)$request->input('user_id') : null;
+        
+        // Déléguer la construction des collections au service réutilisable
+        $presenceCollections = (new PresenceUserService())->getPresenceUserCollections(
+            $userAuth->societe_id, 
+            $this->excludedUserIds,
+            $departementId,
+            $userId
+        );
         $users = $presenceCollections['all'];
         $permanentUsers = $presenceCollections['permanent'];
         $temporaryUsers = $presenceCollections['temporary'];
@@ -208,11 +218,35 @@ private function col(int $i): string {
             try { $spatieRoles = $userAuth->getRoleNames()->map(fn($r)=>strtolower(trim((string)$r)))->toArray(); } catch (\Throwable $e) {}
         }
         $showRecap = ($userRole === 'rh') || in_array('rh', $spatieRoles, true);
-        if ($showRecap) {
-            $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange);
-        } else {
+        // Si un utilisateur spécifique est sélectionné, ne pas créer le récap
+        if ($showRecap && !$userId) {
+            $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange, $departementId, $userId);
+        } else if (!$showRecap) {
             Log::info('Feuille Récap non générée (non RH)', ['user_id' => $userAuth->id ?? null, 'role' => $userRole]);
         }
+        
+        // Si un utilisateur spécifique est sélectionné, masquer les feuilles non pertinentes selon son type
+        if ($userId) {
+            $user = \DB::table('users')->where('id', $userId)->first();
+            if ($user) {
+                $typeContrat = strtolower(trim($user->typeContrat ?? ''));
+                $isPermanent = in_array($typeContrat, ['permanent', 'permanente', 'cdi', 'indéterminée', 'indeterminee']) ||
+                               strpos($typeContrat, 'permanent') !== false ||
+                               strpos($typeContrat, 'cdi') !== false;
+                
+                // Masquer les feuilles selon le type d'employé
+                if ($isPermanent) {
+                    // Employé permanent: masquer la feuille temporaire
+                    $tempSheet = $spreadsheet->getSheetByName('Employés Temporaires');
+                    if ($tempSheet) $tempSheet->setSheetState(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::SHEETSTATE_HIDDEN);
+                } else {
+                    // Employé temporaire: masquer la feuille permanente
+                    $permSheet = $spreadsheet->getSheetByName('Employés Permanents');
+                    if ($permSheet) $permSheet->setSheetState(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::SHEETSTATE_HIDDEN);
+                }
+            }
+        }
+        
         // Réordonner les feuilles selon la demande: Sortants, Non Affectés, Liste Personnel,
         // Employés Permanents, Employés Temporaires, Récap
         $this->reorderSheets($spreadsheet, [
@@ -1349,7 +1383,7 @@ private function col(int $i): string {
         }
         $sheet->freezePane('A4');
     }
-   private function createRecapSheet(Spreadsheet $spreadsheet, $societeId, array $dateRange)
+   private function createRecapSheet(Spreadsheet $spreadsheet, $societeId, array $dateRange, ?int $filterDepartementId = null, ?int $filterUserId = null)
 {
     // -------- Indices colonnes dynamiques selon la période --------
     // Permanents
@@ -1378,14 +1412,24 @@ private function col(int $i): string {
     $tempName     = $tempSheet ? $tempSheet->getTitle() : null;
     // Liste départements basée sur les pointages (pas l'affectation utilisateur)
     // Null ou vide => 'NON AFFECTÉ' (affiché en UPPER)
-    $departements = DB::table('pointages')
+    $departementsQuery = DB::table('pointages')
         ->join('users', 'users.id', '=', 'pointages.user_id')
         ->leftJoin('departements', 'departements.id', '=', 'pointages.departement_id')
         ->where('users.societe_id', $societeId)
         ->whereBetween('pointages.date', [
             $dateRange['startDate']->format('Y-m-d'),
             $dateRange['endDate']->format('Y-m-d')
-        ])
+        ]);
+    
+    // Appliquer les filtres optionnels
+    if ($filterUserId) {
+        $departementsQuery->where('users.id', $filterUserId);
+    }
+    if ($filterDepartementId) {
+        $departementsQuery->where('pointages.departement_id', $filterDepartementId);
+    }
+    
+    $departements = $departementsQuery
         ->select(DB::raw("UPPER(TRIM(COALESCE(NULLIF(TRIM(departements.nom), ''), 'NON AFFECTÉ'))) as dept"))
         ->distinct()
         ->orderBy('dept')

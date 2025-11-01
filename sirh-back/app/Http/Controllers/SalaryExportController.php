@@ -97,21 +97,60 @@ private function presenceStartCol(bool $isPermanent): int
             return response()->json(['error' => 'Accès non autorisé aux données de salaires'], 403);
         }
         $spreadsheet = new Spreadsheet();
+        
+        // Récupérer les filtres optionnels
+        $departementId = $request->input('departement_id') ? (int)$request->input('departement_id') : null;
+        $userId = $request->input('user_id') ? (int)$request->input('user_id') : null;
+        
         /* ===================== FEUILLES PRÉSENCE (même logique que Monthly) ===================== */
         $presenceController = new MonthlyPresenceExportController();
-        $presenceCollections = $presenceController->getPresenceUserCollections($userAuth->societe_id);
+        $excludedUserIds = [80, 265, 270, 271]; // Mêmes exclusions que MonthlyPresenceExportController
+        $presenceService = new \App\Services\PresenceUserService();
+        $presenceCollections = $presenceService->getPresenceUserCollections(
+            $userAuth->societe_id,
+            $excludedUserIds,
+            $departementId,
+            $userId
+        );
         $presenceCallbacks = $presenceController->getPresenceCallbacks();
-        $presenceService = new PresenceSheetService();
-        $presenceService->createPermanentSheet($spreadsheet, $dateRange, $presenceCollections['permanent'], $presenceCallbacks);
-        $presenceService->createTemporarySheet($spreadsheet, $dateRange, $presenceCollections['temporary'], $presenceCallbacks);
+        $sheetService = new PresenceSheetService();
+        $sheetService->createPermanentSheet($spreadsheet, $dateRange, $presenceCollections['permanent'], $presenceCallbacks);
+        $sheetService->createTemporarySheet($spreadsheet, $dateRange, $presenceCollections['temporary'], $presenceCallbacks);
         /* ===================== FEUILLE SALAIRE PERMANENTS ===================== */
-        $this->createSalairePermanentSheet($spreadsheet, $userAuth->societe_id, $dateRange);
+        $this->createSalairePermanentSheet($spreadsheet, $userAuth->societe_id, $dateRange, $presenceCollections['permanent']);
         /* ===================== FEUILLE SALAIRE TEMPORAIRES ===================== */
-        $this->createSalaireTemporaireSheet($spreadsheet, $userAuth->societe_id, $dateRange);
+        $this->createSalaireTemporaireSheet($spreadsheet, $userAuth->societe_id, $dateRange, $presenceCollections['temporary']);
         /* ===================== FEUILLE RECAP CHARGE PERSONNEL ===================== */
-        $this->createRecapChargePersonnelSheet($spreadsheet, $userAuth->societe_id, $dateRange);
-        $this->currentSpreadsheet = $spreadsheet;
-        $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange);
+        // Si un utilisateur spécifique est sélectionné, ne pas créer les récaps
+        if (!$userId) {
+            $this->createRecapChargePersonnelSheet($spreadsheet, $userAuth->societe_id, $dateRange);
+            $this->currentSpreadsheet = $spreadsheet;
+            $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange, $departementId, $userId);
+        }
+        
+        // Si un utilisateur spécifique est sélectionné, masquer les feuilles non pertinentes selon son type
+        if ($userId) {
+            $user = \DB::table('users')->where('id', $userId)->first();
+            if ($user) {
+                $isPermanent = $this->isPermanent($user);
+                
+                // Masquer les feuilles selon le type d'employé
+                if ($isPermanent) {
+                    // Employé permanent: masquer les feuilles temporaires
+                    $tempPresenceSheet = $spreadsheet->getSheetByName('Employés Temporaires');
+                    $tempSalaireSheet = $spreadsheet->getSheetByName('Salaire Temporaire');
+                    if ($tempPresenceSheet) $tempPresenceSheet->setSheetState(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::SHEETSTATE_HIDDEN);
+                    if ($tempSalaireSheet) $tempSalaireSheet->setSheetState(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::SHEETSTATE_HIDDEN);
+                } else {
+                    // Employé temporaire: masquer les feuilles permanentes
+                    $permPresenceSheet = $spreadsheet->getSheetByName('Employés Permanents');
+                    $permSalaireSheet = $spreadsheet->getSheetByName('Salaire Permanent');
+                    if ($permPresenceSheet) $permPresenceSheet->setSheetState(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::SHEETSTATE_HIDDEN);
+                    if ($permSalaireSheet) $permSalaireSheet->setSheetState(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::SHEETSTATE_HIDDEN);
+                }
+            }
+        }
+        
         return $this->exportExcel($spreadsheet, $dateRange, 'Salaires');
     }
     /* ----------------------- Helpers: dates & type ----------------------- */
@@ -191,39 +230,65 @@ private function presenceStartCol(bool $isPermanent): int
                 return null;
         }
     }
-    private function createSalairePermanentSheet($spreadsheet, $societeId, $dateRange)
+    private function createSalairePermanentSheet($spreadsheet, $societeId, $dateRange, $permanentUsersCollection = null)
     {
         $sheet = new Worksheet($spreadsheet, 'Salaire Permanent');
         $spreadsheet->addSheet($sheet);
         $spreadsheet->setActiveSheetIndex($spreadsheet->getIndex($sheet));
-        // Récupérer tous les employés permanents (y compris inactifs avec pointages)
-        $allEmployes = DB::table('users')
-            ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
-            ->leftJoin('salaires', 'users.id', '=', 'salaires.user_id')
-            ->where('users.societe_id', $societeId)
-            ->where(function($query) {
-                $query->whereIn(DB::raw('LOWER(TRIM(COALESCE(users.typeContrat, "")))'), 
-                    ['permanent', 'permanente', 'cdi', 'indéterminée', 'indeterminee'])
-                      ->orWhere('users.typeContrat', 'LIKE', '%permanent%')
-                      ->orWhere('users.typeContrat', 'LIKE', '%CDI%');
-            })
-            ->select(
-                'users.id', 'users.name', 'users.prenom', 'users.fonction','users.statut',
-                DB::raw('MAX(salaires.salaire_base) as salaire_base'),
-                DB::raw('MAX(salaires.salaire_net) as salaire_net'),
-                'departements.nom as departement_nom'
-            )
-            ->groupBy('users.id','users.name','users.prenom','users.fonction','users.statut','departements.nom')
-            ->orderBy('users.name')
-            ->get();
-        // Filtrer les employés : actifs + inactifs avec pointages dans la période
-        $employes = $allEmployes->filter(function($user) use ($dateRange) {
-            $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
-            if ($statutGlobal === 'inactif') {
-                return $this->hasPointagesInPeriod($user->id, $dateRange);
-            }
-            return true; // Utilisateurs actifs
-        });
+        
+        // Si une collection filtrée est fournie, l'utiliser directement
+        if ($permanentUsersCollection !== null) {
+            // Enrichir avec les données de salaires
+            $userIds = $permanentUsersCollection->pluck('id')->toArray();
+            $salaires = DB::table('salaires')
+                ->whereIn('user_id', $userIds)
+                ->select('user_id', DB::raw('MAX(salaire_base) as salaire_base'), DB::raw('MAX(salaire_net) as salaire_net'))
+                ->groupBy('user_id')
+                ->get()
+                ->keyBy('user_id');
+            
+            $employes = $permanentUsersCollection->map(function($user) use ($salaires) {
+                $salaire = $salaires->get($user->id);
+                $user->salaire_base = $salaire->salaire_base ?? null;
+                $user->salaire_net = $salaire->salaire_net ?? null;
+                return $user;
+            })->filter(function($user) use ($dateRange) {
+                $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
+                if ($statutGlobal === 'inactif') {
+                    return $this->hasPointagesInPeriod($user->id, $dateRange);
+                }
+                return true;
+            });
+        } else {
+            // Comportement par défaut (legacy): récupérer tous les employés permanents
+            $allEmployes = DB::table('users')
+                ->leftJoin('departements', 'users.departement_id', '=', 'departements.id')
+                ->leftJoin('salaires', 'users.id', '=', 'salaires.user_id')
+                ->where('users.societe_id', $societeId)
+                ->where(function($query) {
+                    $query->whereIn(DB::raw('LOWER(TRIM(COALESCE(users.typeContrat, "")))'), 
+                        ['permanent', 'permanente', 'cdi', 'indéterminée', 'indeterminee'])
+                          ->orWhere('users.typeContrat', 'LIKE', '%permanent%')
+                          ->orWhere('users.typeContrat', 'LIKE', '%CDI%');
+                })
+                ->select(
+                    'users.id', 'users.name', 'users.prenom', 'users.fonction','users.statut',
+                    DB::raw('MAX(salaires.salaire_base) as salaire_base'),
+                    DB::raw('MAX(salaires.salaire_net) as salaire_net'),
+                    'departements.nom as departement_nom'
+                )
+                ->groupBy('users.id','users.name','users.prenom','users.fonction','users.statut','departements.nom')
+                ->orderBy('users.name')
+                ->get();
+            // Filtrer les employés : actifs + inactifs avec pointages dans la période
+            $employes = $allEmployes->filter(function($user) use ($dateRange) {
+                $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
+                if ($statutGlobal === 'inactif') {
+                    return $this->hasPointagesInPeriod($user->id, $dateRange);
+                }
+                return true; // Utilisateurs actifs
+            });
+        }
         // Titre principal
         $row = 1;
         $sheet->setCellValue('A' . $row, 'SALAIRES EMPLOYÉS PERMANENTS');
@@ -399,24 +464,36 @@ private function presenceStartCol(bool $isPermanent): int
         $sheet->getColumnDimension('U')->setVisible(false);
         $sheet->freezePane('A5');
     }
-    private function createSalaireTemporaireSheet($spreadsheet, $societeId, $dateRange)
+    private function createSalaireTemporaireSheet($spreadsheet, $societeId, $dateRange, $temporaryUsersCollection = null)
     {
         $sheet = new Worksheet($spreadsheet, 'Salaire Temporaire');
         $spreadsheet->addSheet($sheet);
         $spreadsheet->setActiveSheetIndex($spreadsheet->getIndex($sheet));
-        // Récupérer tous les temporaires (y compris inactifs) ayant au moins un pointage PRESENT ou RETARD dans la période
-        $allTemporaires = DB::table('users')
-            ->where('users.societe_id', $societeId)
-            ->get()
-            ->filter(function($u){ return !$this->isPermanent($u); });
-        // Filtrer les temporaires : actifs + inactifs avec pointages dans la période
-        $rawTemporaires = $allTemporaires->filter(function($user) use ($dateRange) {
-            $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
-            if ($statutGlobal === 'inactif') {
-                return $this->hasPointagesInPeriod($user->id, $dateRange);
-            }
-            return true; // Utilisateurs actifs
-        });
+        
+        // Si une collection filtrée est fournie, l'utiliser
+        if ($temporaryUsersCollection !== null) {
+            $rawTemporaires = $temporaryUsersCollection->filter(function($user) use ($dateRange) {
+                $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
+                if ($statutGlobal === 'inactif') {
+                    return $this->hasPointagesInPeriod($user->id, $dateRange);
+                }
+                return true;
+            });
+        } else {
+            // Comportement par défaut (legacy)
+            $allTemporaires = DB::table('users')
+                ->where('users.societe_id', $societeId)
+                ->get()
+                ->filter(function($u){ return !$this->isPermanent($u); });
+            // Filtrer les temporaires : actifs + inactifs avec pointages dans la période
+            $rawTemporaires = $allTemporaires->filter(function($user) use ($dateRange) {
+                $statutGlobal = strtolower(trim((string)($user->statut ?? '')));
+                if ($statutGlobal === 'inactif') {
+                    return $this->hasPointagesInPeriod($user->id, $dateRange);
+                }
+                return true; // Utilisateurs actifs
+            });
+        }
         $ids = $rawTemporaires->pluck('id')->all();
         $employes = collect();
         if (!empty($ids)) {
@@ -1094,8 +1171,11 @@ private function xlIndirectRange(string $sheetName, int $colIndex, int $rowStart
 /**
  * Feuille "Récap" — agrège effectif moyen / total effectif / HN / HS par département,
  * en gelant les plages des feuilles source via INDIRECT pour éviter tout glissement.
+ * 
+ * @param int|null $filterDepartementId Filtre optionnel par département
+ * @param int|null $filterUserId Filtre optionnel par utilisateur
  */
-private function createRecapSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $spreadsheet, $societeId, array $dateRange)
+private function createRecapSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $spreadsheet, $societeId, array $dateRange, ?int $filterDepartementId = null, ?int $filterUserId = null)
 {
     // -------- Indices colonnes dynamiques selon la période --------
     // Permanents
@@ -1129,15 +1209,25 @@ private function createRecapSheet(\PhpOffice\PhpSpreadsheet\Spreadsheet $spreads
     $permName = $permSheet ? $permSheet->getTitle() : null;
     $tempName = $tempSheet ? $tempSheet->getTitle() : null;
 
-    // Liste des départements (basée sur les pointages)
-    $departements = \DB::table('pointages')
+    // Liste des départements (basée sur les pointages, avec filtres optionnels)
+    $departementsQuery = \DB::table('pointages')
         ->join('users', 'users.id', '=', 'pointages.user_id')
         ->leftJoin('departements', 'departements.id', '=', 'pointages.departement_id')
         ->where('users.societe_id', $societeId)
         ->whereBetween('pointages.date', [
             $dateRange['startDate']->format('Y-m-d'),
             $dateRange['endDate']->format('Y-m-d')
-        ])
+        ]);
+    
+    // Appliquer les filtres
+    if ($filterUserId) {
+        $departementsQuery->where('users.id', $filterUserId);
+    }
+    if ($filterDepartementId) {
+        $departementsQuery->where('pointages.departement_id', $filterDepartementId);
+    }
+    
+    $departements = $departementsQuery
         ->select(\DB::raw("UPPER(TRIM(COALESCE(NULLIF(TRIM(departements.nom), ''), 'NON AFFECTÉ'))) as dept"))
         ->distinct()
         ->orderBy('dept')
