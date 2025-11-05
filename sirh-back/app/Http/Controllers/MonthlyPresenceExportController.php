@@ -218,8 +218,8 @@ private function col(int $i): string {
             try { $spatieRoles = $userAuth->getRoleNames()->map(fn($r)=>strtolower(trim((string)$r)))->toArray(); } catch (\Throwable $e) {}
         }
         $showRecap = ($userRole === 'rh') || in_array('rh', $spatieRoles, true);
-        // Si un utilisateur spécifique est sélectionné, ne pas créer le récap
-        if ($showRecap && !$userId) {
+        // Ne pas créer le récap si un département OU un utilisateur est sélectionné
+        if ($showRecap && !$userId && !$departementId) {
             $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange, $departementId, $userId);
         } else if (!$showRecap) {
             Log::info('Feuille Récap non générée (non RH)', ['user_id' => $userAuth->id ?? null, 'role' => $userRole]);

@@ -121,8 +121,8 @@ private function presenceStartCol(bool $isPermanent): int
         /* ===================== FEUILLE SALAIRE TEMPORAIRES ===================== */
         $this->createSalaireTemporaireSheet($spreadsheet, $userAuth->societe_id, $dateRange, $presenceCollections['temporary']);
         /* ===================== FEUILLE RECAP CHARGE PERSONNEL ===================== */
-        // Si un utilisateur spécifique est sélectionné, ne pas créer les récaps
-        if (!$userId) {
+        // Ne pas créer les récaps si un département OU un utilisateur est sélectionné
+        if (!$userId && !$departementId) {
             $this->createRecapChargePersonnelSheet($spreadsheet, $userAuth->societe_id, $dateRange);
             $this->currentSpreadsheet = $spreadsheet;
             $this->createRecapSheet($spreadsheet, $userAuth->societe_id, $dateRange, $departementId, $userId);
